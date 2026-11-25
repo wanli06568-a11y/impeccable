@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import http from 'node:http';
@@ -74,6 +74,15 @@ async function exercise(t, scenario) {
     fs.writeFileSync(path.join(cache, 'bin'), 'blocked');
   }
   if (scenario === 'cache-write-failure') fs.mkdirSync(cacheDir, { recursive: true });
+  if (scenario === 'cache-read-only') {
+    // An old part the sweep cannot remove must not end the run early.
+    fs.mkdirSync(cacheDir, { recursive: true });
+    const stale = path.join(cacheDir, `.impeccable.part.${spawnSync(process.execPath, ['-e', '']).pid}`);
+    fs.writeFileSync(stale, 'partial');
+    const when = new Date(Date.now() - 3 * 24 * 3600 * 1000);
+    fs.utimesSync(stale, when, when);
+    fs.chmodSync(cacheDir, 0o555);
+  }
   if (scenario === 'stale-staging') {
     // Leftovers from an older launcher (fixed staging names) or a killed run
     // must not block or be reused by a new download.
@@ -84,8 +93,37 @@ async function exercise(t, scenario) {
       fs.chmodSync(stale, 0o444);
     }
   }
+  let survivors = [];
+  if (scenario === 'swept-staging') {
+    // #1541: SIGKILL skips the launcher's traps, so staging leftovers pile up
+    // in every version's cache until a later download sweeps them.
+    const oldVersionDir = path.join(cache, 'bin', '0.0.0-old');
+    const dead = () => spawnSync(process.execPath, ['-e', '']).pid;
+    const stale = WINDOWS
+      ? ['.impeccable.part.0912-1', '.impeccable.part.0913-2', '.impeccable.part.0914-3']
+      : [`.impeccable.part.${dead()}`, `.impeccable.part.${process.pid}`, `.impeccable.part.${dead()}`];
+    // Old with a dead owner, old with a live one (cmd has no PID to check, so
+    // only the age decides there), recent with a dead owner.
+    survivors = WINDOWS ? [stale[2]] : [stale[1], stale[2]];
+    const leftovers = [[cacheDir, stale[0], true], [cacheDir, stale[1], true], [cacheDir, stale[2], false], [oldVersionDir, stale[0], true]];
+    for (const [dir, name, old] of leftovers) {
+      fs.mkdirSync(dir, { recursive: true });
+      const leftover = path.join(dir, name);
+      if (WINDOWS) {
+        fs.mkdirSync(leftover);
+        fs.writeFileSync(path.join(leftover, BIN), 'partial');
+      } else {
+        fs.writeFileSync(leftover, 'partial');
+      }
+      const when = new Date(Date.now() - 3 * 24 * 3600 * 1000);
+      if (old) fs.utimesSync(leftover, when, when);
+    }
+  }
   const tools = path.join(root, 'tools');
   fs.mkdirSync(tools);
+  if (!WINDOWS && scenario === 'github-outage') {
+    fs.writeFileSync(path.join(tools, 'curl'), "#!/bin/sh\nprintf '%s' '504 https://release-assets.githubusercontent.com/asset'\nexit 22\n", { mode: 0o755 });
+  }
   if (!WINDOWS && scenario === 'cache-write-failure') {
     // The POSIX staging name contains the launcher's PID, so intercept the
     // preceding mkdir to place a directory at precisely that file path.
@@ -101,6 +139,14 @@ async function exercise(t, scenario) {
     const before = scenario === 'removed-before-move' ? 'rm -f "$2"\n' : '';
     const after = scenario === 'removed-after-move' ? 'rm -f "$3"\n' : scenario === 'emptied-after-move' ? ': > "$3"\n' : '';
     fs.writeFileSync(path.join(tools, 'mv'), scenario === 'move-failure' ? '#!/bin/sh\nexit 1\n' : `#!/bin/sh\n${before}/bin/mv "$@" || exit $?\n${after}`, { mode: 0o755 });
+  }
+  if (WINDOWS && scenario === 'github-outage') {
+    // curl.exe is an executable, so instrument only that external boundary
+    // in the staged launcher, as the hash/move fault cases below do.
+    const source = fs.readFileSync(launcher, 'utf8');
+    assert.match(source, /^curl\.exe .*$/m);
+    fs.writeFileSync(launcher, source.replace(/^curl\.exe [^\r\n]*\r?\n/gm,
+      '>"%staging%\\http.txt" echo 504 https://release-assets.githubusercontent.com/asset\r\ncmd /c exit 22\r\n'));
   }
   if (WINDOWS && scenario === 'cache-write-failure') {
     // The cmd launcher claims a fresh staging directory per run, so no
@@ -140,6 +186,13 @@ async function exercise(t, scenario) {
   const interrupt = scenario.startsWith('interrupt-') ? scenario.slice('interrupt-'.length) : null;
   let stalled;
   const stall = new Promise(resolve => { stalled = resolve; });
+  let redirectBase;
+  if (scenario === 'outage-redirect') {
+    const storage = http.createServer((req, res) => { res.writeHead(504); res.end(); });
+    await new Promise(resolve => storage.listen(0, '127.0.0.1', resolve));
+    t.after(() => new Promise(resolve => storage.close(resolve)));
+    redirectBase = `http://localhost:${storage.address().port}`;
+  }
   const server = http.createServer((req, res) => {
     requests.push(req.url);
     if (scenario === 'transport-failure') {
@@ -151,6 +204,10 @@ async function exercise(t, scenario) {
       res.writeHead(200);
       res.write(PAYLOAD.subarray(0, 8), stalled);
       return;
+    }
+    if (scenario === 'outage-503') { res.writeHead(503); res.end(); return; }
+    if (scenario === 'outage-redirect') {
+      res.writeHead(302, { location: `${redirectBase}/engine` }); res.end(); return;
     }
     if (scenario === 'download-failure') res.writeHead(404);
     res.end(scenario === 'empty-download' ? '' : PAYLOAD);
@@ -180,6 +237,7 @@ async function exercise(t, scenario) {
     child.on('close', (status, signal) => resolve({ status, signal, stdout, stderr }));
   });
   const result = await run();
+  if (scenario === 'cache-read-only') fs.chmodSync(cacheDir, 0o755);
   if (scenario === 'valid') {
     // The stamp is the whole check on later runs: a hash tool that always
     // fails proves nothing rehashes the cached engine.
@@ -192,11 +250,11 @@ async function exercise(t, scenario) {
     assert.equal(requests.length, requestCount, 'subsequent runs use the cached engine without network');
   }
   assert.equal(result.signal, null, JSON.stringify(result));
-  const noDownload = scenario.startsWith('cache-') || scenario.startsWith('no-manifest')
+  const noDownload = scenario === 'github-outage' || scenario.startsWith('cache-') || scenario.startsWith('no-manifest')
     || ['cached-unstamped', 'cached-empty-stamp', 'cached-foreign-stamp', 'cached-digest-only-stamp', 'cached-stamp-trusted'].includes(scenario);
-  assert.equal(requests.length, noDownload ? 0 : 1,
+  assert.equal(requests.length, noDownload ? 0 : scenario.startsWith('outage-') ? 3 : 1,
     'cache failures, a missing digest and a verified cache make no request; other scenarios download once');
-  return { ...result, files: fs.existsSync(cacheDir) ? fs.readdirSync(cacheDir).sort() : [], requests, cacheDir };
+  return { ...result, survivors, files: fs.existsSync(cacheDir) ? fs.readdirSync(cacheDir).sort() : [], requests, cacheDir };
 }
 
 for (const scenario of ['cache-directory-failure', 'cache-write-failure', 'download-failure', 'transport-failure']) {
@@ -212,6 +270,8 @@ for (const scenario of ['cache-directory-failure', 'cache-write-failure', 'downl
     if (['download-failure', 'transport-failure'].includes(scenario)) {
       assert.match(result.stderr, /could not download/);
       assert.match(result.stderr, /network/);
+      // curl older than 7.75 has no %{errormsg}, so only the exit code is certain.
+      assert.match(result.stderr, /\(curl exit \d+(: [^)]+)?\);/);
       assert.deepEqual(result.files, [], 'failed downloads leave no staging files');
       assert.equal(result.requests.length, 1, 'no verification without a download');
     } else {
@@ -297,7 +357,21 @@ test('launcher ignores stale staging files from older or killed runs', async t =
   assert.match(result.stdout, /verified-engine/);
   assert.deepEqual(result.files.sort(),
     ['.impeccable.part.1', BIN, `${BIN}.verified`, 'impeccable.exe.part', 'impeccable.exe.sha256'].sort(),
-    'the new download lands and leaves the leftovers untouched');
+    'the new download lands and leaves recent leftovers untouched');
+});
+
+test('launcher sweeps staging leftovers that no live download owns', async t => {
+  const result = await exercise(t, 'swept-staging');
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /verified-engine/);
+  assert.deepEqual(result.files, [...result.survivors, BIN, `${BIN}.verified`].sort());
+  assert.deepEqual(fs.readdirSync(path.join(result.cacheDir, '..', '0.0.0-old')), [], 'older versions are swept too');
+});
+
+test('sh launcher reports a read-only cache holding a stale part', { skip: WINDOWS || process.getuid?.() === 0 ? 'POSIX permissions, non-root' : false }, async t => {
+  const result = await exercise(t, 'cache-read-only');
+  assert.equal(result.status, 127, JSON.stringify(result));
+  assert.match(result.stderr, /cannot write to cache directory/);
 });
 
 test('cmd launcher stages each run under its own name', () => {
@@ -312,6 +386,76 @@ test('cmd launcher is checked out with CRLF line endings', () => {
   const source = fs.readFileSync(path.join(ROOT, 'skill/scripts/impeccable.cmd'));
   const withoutCrlf = Buffer.from(source.toString('binary').replaceAll('\r\n', ''));
   assert.equal(withoutCrlf.includes(10), false, 'cmd.exe batch labels require CRLF line endings');
+});
+
+test('sh launcher is checked out with LF line endings', () => {
+  const source = fs.readFileSync(path.join(ROOT, 'skill/scripts/impeccable'));
+  assert.equal(source.includes(13), false, 'sh fails on a CR in the launcher (#1462)');
+});
+
+test('cmd launcher calls PATH candidates so a batch shim returns to it', () => {
+  // Without `call`, cmd.exe hands control to a .cmd candidate and never comes
+  // back, so the probe and the verb it was meant to run are lost (#1240).
+  const source = fs.readFileSync(path.join(ROOT, 'skill/scripts/impeccable.cmd'), 'utf8');
+  assert.match(source, /^call "%~1" engine-probe >"%probe_tmp%" 2>nul\r?$/m);
+  assert.match(source, /^call "%path_bin%" %\*\r?$/m, 'a batch shim runs under call');
+  assert.doesNotMatch(source, /^"%~1" engine-probe/m);
+});
+
+test('cmd launcher runs a PATH binary directly so % in its arguments survives', () => {
+  // call expands % in its arguments a second time, so `a%20b%20c` would lose
+  // `%20b%`; only a .cmd or .bat candidate needs call to return.
+  const source = fs.readFileSync(path.join(ROOT, 'skill/scripts/impeccable.cmd'), 'utf8');
+  assert.match(source, /^if \/I "%path_ext%"==".cmd" goto path_shim\r?$/m);
+  assert.match(source, /^if \/I "%path_ext%"==".bat" goto path_shim\r?$/m);
+  assert.match(source, /^"%path_bin%" %\*\r?$/m, 'a binary runs without call');
+  // npm writes an extensionless POSIX shim next to impeccable.cmd; where lists it first.
+  assert.match(source, /for %%k in \(\.exe \.com \.cmd \.bat\) do if \/I "%%~xc"=="%%k"/, 'only a runnable extension is taken');
+  // A FOR letter that is also a path modifier (d p n x s a t z f) makes %%~x<v> ambiguous.
+  for (const [, v] of source.matchAll(/%%~[a-z$:]*?x([a-z])\b/gi)) assert.doesNotMatch(v, /[dpnxsatzf]/i, `%%~x on a loop variable whose letter is a path modifier: %%${v}`);
+  assert.doesNotMatch(source, /^call impeccable %\*/m);
+});
+
+test('cmd launcher runs a .cmd engine shim found on PATH', { skip: WINDOWS ? false : 'Windows-only cmd launcher PATH probe' }, async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'impeccable-launcher-shim-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const scripts = path.join(root, 'scripts');
+  const tools = path.join(root, 'tools');
+  const home = path.join(root, 'home');
+  for (const dir of [scripts, tools, home]) fs.mkdirSync(dir);
+  fs.writeFileSync(path.join(scripts, 'VERSION'), '0.0.0-test\n');
+  const launcher = path.join(scripts, 'impeccable.cmd');
+  fs.copyFileSync(path.join(ROOT, 'skill/scripts/impeccable.cmd'), launcher);
+  // npm also writes an extensionless POSIX shim; where lists it first.
+  fs.writeFileSync(path.join(tools, 'impeccable'), '#!/bin/sh\nexec node "$basedir/x.js" "$@"\n');
+  // An npm-style batch shim that answers the handshake, then runs the verb.
+  fs.writeFileSync(path.join(tools, 'impeccable.cmd'), [
+    '@echo off',
+    'if "%~1"=="engine-probe" (echo impeccable-engine 0.0.0-test& exit /b 0)',
+    'echo path-shim-ran %*',
+    'exit /b 0',
+    '',
+  ].join('\r\n'));
+  const env = {
+    PATH: `${tools};${process.env.SystemRoot}\\System32;${process.env.SystemRoot}`,
+    HOME: home, USERPROFILE: home, TEMP: root, TMP: root,
+    IMPECCABLE_HOME: path.join(root, 'cache'),
+    SystemRoot: process.env.SystemRoot,
+    ComSpec: COMSPEC,
+    PROCESSOR_ARCHITECTURE: 'AMD64',
+  };
+  const result = await new Promise((resolve, reject) => {
+    let stdout = '';
+    let stderr = '';
+    const child = spawn(COMSPEC, ['/d', '/s', '/c', `""${launcher}" detect"`], { env, cwd: root, windowsVerbatimArguments: true, timeout: 20000 });
+    child.stdout.on('data', chunk => { stdout += chunk; });
+    child.stderr.on('data', chunk => { stderr += chunk; });
+    child.on('error', reject);
+    child.on('close', (status, signal) => resolve({ status, signal, stdout, stderr }));
+  });
+  assert.equal(result.signal, null, JSON.stringify(result));
+  assert.equal(result.status, 0, JSON.stringify(result));
+  assert.match(result.stdout, /path-shim-ran detect/, 'the launcher came back from the probe and ran the verb');
 });
 
 test('cmd launcher forwards engine exit code through cmd /c', { skip: WINDOWS ? false : 'Windows-only cmd /c exit-code forwarding' }, async t => {
@@ -530,5 +674,148 @@ for (const [signal, status] of [['SIGINT', 130], ['SIGTERM', 143]]) {
     const result = await exercise(t, `interrupt-${signal}`);
     assert.equal(result.status, status, JSON.stringify(result));
     assert.deepEqual(result.files, [], 'no staging file left behind');
+  });
+}
+
+for (const [scenario, host, status] of [['outage-503', '127.0.0.1', 503], ['outage-redirect', 'localhost', 504]]) {
+  test(`launcher attributes ${scenario} to the final download host`, async t => {
+    const result = await exercise(t, scenario);
+    assert.equal(result.status, 127, result.stderr);
+    assert.ok(result.stderr.includes(`could not download engine 0.0.0-test: ${host} is failing right now (HTTP ${status}), a server error on ${host}'s side. Try again later.`), result.stderr);
+    assert.doesNotMatch(result.stderr, /setup needs|check network|engine-probe/);
+    assert.deepEqual(result.files, []);
+  });
+}
+
+test('launcher attributes GitHub storage outages to GitHub', async t => {
+  const result = await exercise(t, 'github-outage');
+  assert.equal(result.status, 127);
+  // cmd echo adds a trailing space before redirection and uses CRLF.
+  assert.equal(result.stderr.trimEnd(), "impeccable: could not download engine 0.0.0-test: GitHub's downloads are failing right now (HTTP 504 from release-assets.githubusercontent.com). This is an outage on GitHub's side, not a problem with your setup or the CLI, so updating won't help. Check https://www.githubstatus.com and run the same command again once GitHub has recovered.");
+});
+
+// #1237: hooks run this launcher on every edit and turn end, and on a loaded
+// Windows box each process it starts before the engine costs seconds. With a
+// verified cached engine it may start at most one uname and one wc.
+test('sh launcher reaches a cached engine starting almost no processes', { skip: WINDOWS ? 'POSIX launcher' : false }, async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'impeccable-launcher-cost-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const scripts = path.join(root, 'skill scripts');
+  const cacheDir = path.join(root, 'cache', 'bin', '0.0.0-test');
+  const tools = path.join(root, 'tools');
+  const log = path.join(root, 'spawned.log');
+  for (const dir of [scripts, cacheDir, tools, path.join(root, 'home')]) fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(scripts, 'VERSION'), '0.0.0-test\n');
+  fs.copyFileSync(path.join(ROOT, 'skill/scripts/impeccable'), path.join(scripts, 'impeccable'));
+  // The stub reports where it runs and the skill dir it was handed.
+  const engine = Buffer.from('#!/bin/sh\necho "verified-engine cwd=$PWD skill=$IMPECCABLE_SKILL_DIR"\n');
+  const digest = createHash('sha256').update(engine).digest('hex');
+  fs.writeFileSync(path.join(scripts, 'engine-checksums.txt'), `0.0.0-test ${ASSET} ${digest}\n`);
+  const cached = path.join(cacheDir, BIN);
+  fs.writeFileSync(cached, engine, { mode: 0o755 });
+  fs.writeFileSync(`${cached}.verified`, `${digest} ${engine.length}\n`);
+  const project = path.join(root, 'project');
+  fs.mkdirSync(project);
+  const past = new Date(Date.now() - 60000);
+  fs.utimesSync(cached, past, past);
+  // Every external tool the launcher could reach logs itself, then runs.
+  for (const name of ['dirname', 'uname', 'tr', 'wc', 'cat', 'sed', 'awk', 'basename', 'shasum', 'sha256sum', 'printf']) {
+    const real = ['/usr/bin', '/bin'].map(d => path.join(d, name)).find(p => fs.existsSync(p));
+    if (!real) continue;
+    fs.writeFileSync(path.join(tools, name), `#!/bin/sh\necho ${name} >> '${log}'\nexec '${real}' "$@"\n`, { mode: 0o755 });
+  }
+  const result = spawnSync('/bin/sh', [path.join(scripts, 'impeccable'), 'engine-probe'], {
+    encoding: 'utf8',
+    cwd: project,
+    env: { PATH: tools, HOME: path.join(root, 'home'), IMPECCABLE_HOME: path.join(root, 'cache') },
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout.trim(), `verified-engine cwd=${fs.realpathSync(project)} skill=${root}`,
+    'the engine runs in the caller\'s directory and gets the skill dir');
+  const spawned = fs.existsSync(log) ? fs.readFileSync(log, 'utf8').trim().split('\n').filter(Boolean) : [];
+  const count = name => spawned.filter(s => s === name).length;
+  assert.deepEqual(spawned.filter(s => !['uname', 'wc'].includes(s)), [], `no other tool runs: ${spawned}`);
+  assert.ok(count('uname') <= 1 && count('wc') <= 1, `at most one uname and one wc: ${spawned}`);
+});
+
+// The Windows branch reads OS and PROCESSOR_ARCHITECTURE instead of uname.
+// Exercised from a POSIX shell: a uname that runs at all fails the case.
+for (const [arch, manifestAsset] of [['AMD64', 'impeccable-windows-x64.exe'], ['ARM64', 'impeccable-windows-x64.exe'], ['ARM64', 'impeccable-windows-arm64.exe']]) {
+  test(`sh launcher on Windows ${arch} runs the cached engine stamped for ${manifestAsset} without uname`, { skip: WINDOWS ? 'POSIX shell stand-in for Git Bash' : false }, async t => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'impeccable-launcher-win-'));
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const scripts = path.join(root, 'scripts');
+    const cacheDir = path.join(root, 'cache', 'bin', '0.0.0-test');
+    const tools = path.join(root, 'tools');
+    for (const dir of [scripts, cacheDir, tools, path.join(root, 'home')]) fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(scripts, 'VERSION'), '0.0.0-test\n');
+    fs.copyFileSync(path.join(ROOT, 'skill/scripts/impeccable'), path.join(scripts, 'impeccable'));
+    const engine = Buffer.from('#!/bin/sh\necho windows-engine\n');
+    const digest = createHash('sha256').update(engine).digest('hex');
+    fs.writeFileSync(path.join(scripts, 'engine-checksums.txt'), `0.0.0-test ${manifestAsset} ${digest}\n`);
+    const cached = path.join(cacheDir, 'impeccable.exe');
+    fs.writeFileSync(cached, engine, { mode: 0o755 });
+    fs.writeFileSync(`${cached}.verified`, `${digest} ${engine.length}\n`);
+    const past = new Date(Date.now() - 60000);
+    fs.utimesSync(cached, past, past);
+    fs.writeFileSync(path.join(tools, 'uname'), `#!/bin/sh\necho uname-ran >&2\nexit 1\n`, { mode: 0o755 });
+    for (const name of ['wc']) {
+      const real = ['/usr/bin', '/bin'].map(d => path.join(d, name)).find(p => fs.existsSync(p));
+      fs.writeFileSync(path.join(tools, name), `#!/bin/sh\nexec '${real}' "$@"\n`, { mode: 0o755 });
+    }
+    const result = spawnSync('/bin/sh', [path.join(scripts, 'impeccable'), 'engine-probe'], {
+      encoding: 'utf8',
+      env: { PATH: tools, HOME: path.join(root, 'home'), IMPECCABLE_HOME: path.join(root, 'cache'), OS: 'Windows_NT', PROCESSOR_ARCHITECTURE: arch },
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout.trim(), 'windows-engine');
+    assert.doesNotMatch(result.stderr, /uname-ran/);
+  });
+}
+
+// #1462: Windows hook commands spell the launcher C:\...\scripts\impeccable,
+// and Git Bash hands that backslash-only $0 to the script. On Windows this runs
+// the launcher through Git's own sh; elsewhere a directory literally named
+// `skill\scripts` stands in, since a backslash is an ordinary filename byte.
+const GIT_SH = WINDOWS ? (() => {
+  const exec = spawnSync('git', ['--exec-path'], { encoding: 'utf8' }).stdout?.trim();
+  const git = exec && path.resolve(exec, '..', '..', '..');
+  return git && ['usr/bin/sh.exe', 'bin/sh.exe'].map(p => path.join(git, p)).find(p => fs.existsSync(p));
+})() : '/bin/sh';
+for (const form of WINDOWS ? ['absolute'] : ['absolute', 'relative']) {
+  test(`sh launcher finds its directory from a backslash path (${form})`, { skip: GIT_SH || process.env.CI ? false : 'no Git sh' }, t => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'impeccable-launcher-bs-'));
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const scripts = WINDOWS ? path.join(root, 'skill scripts') : path.join(root, 'skill\\scripts');
+    const sibling = path.join(scripts, 'bin', 'windows-x64', 'impeccable.exe');
+    const project = path.join(root, 'project');
+    fs.mkdirSync(path.dirname(sibling), { recursive: true });
+    fs.mkdirSync(project);
+    fs.writeFileSync(path.join(scripts, 'VERSION'), '0.0.0-test\n');
+    if (WINDOWS) {
+      fs.copyFileSync(process.execPath, sibling);
+      fs.writeFileSync(path.join(project, 'engine-probe.js'), "console.log('impeccable-engine 0.0.0-test');\n");
+    } else {
+      fs.writeFileSync(sibling, '#!/bin/sh\necho impeccable-engine 0.0.0-test\n', { mode: 0o755 });
+    }
+    // On POSIX the file sh opens is named `skill\scripts\impeccable`, next to the directory.
+    const launcher = WINDOWS ? path.join(scripts, 'impeccable') : `${scripts}\\impeccable`;
+    // A CRLF checkout (core.autocrlf) would break sh on `set -eu\r`.
+    fs.writeFileSync(launcher, fs.readFileSync(path.join(ROOT, 'skill/scripts/impeccable'), 'utf8').replace(/\r\n/g, '\n'));
+    const arg0 = form === 'relative' ? path.basename(launcher) : launcher;
+    // On Windows, spelled as the hook command is: a double-quoted path in `sh -c`.
+    const result = spawnSync(GIT_SH, WINDOWS ? ['-c', `"${launcher}" engine-probe`] : [arg0, 'engine-probe'], {
+      encoding: 'utf8',
+      cwd: form === 'relative' ? root : project,
+      env: {
+        PATH: WINDOWS ? `${path.dirname(GIT_SH)};${process.env.SystemRoot}\\System32` : '/usr/bin:/bin',
+        HOME: path.join(root, 'home'),
+        OS: 'Windows_NT',
+        PROCESSOR_ARCHITECTURE: 'AMD64',
+        ...(WINDOWS ? { SystemRoot: process.env.SystemRoot } : {}),
+      },
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout.trim(), 'impeccable-engine 0.0.0-test');
   });
 }

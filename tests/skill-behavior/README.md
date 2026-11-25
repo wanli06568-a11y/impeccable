@@ -18,7 +18,7 @@ IMPECCABLE_SKILL_BEHAVIOR_MODELS=claude-sonnet-5 bun run test:skill-behavior   #
 IMPECCABLE_SKILL_BEHAVIOR_EFFORT=xhigh bun run test:skill-behavior             # OpenAI reasoning effort (default: high)
 ```
 
-Requires `.env` at repo root with at least one of `ANTHROPIC_API_KEY`,
+Requires `~/.config/impeccable/dev.env` (mode 0600) or the environment to hold at least one of `ANTHROPIC_API_KEY`,
 `OPENAI_API_KEY`, `GOOGLE_CLOUD_API_KEY`, `DEEPSEEK_API_KEY`. Providers without a key are
 skipped, not failed.
 
@@ -109,6 +109,47 @@ What the measurement found:
   point of recall.
 - Gemini's misses mostly go to the frontend-dev neighbour, so results depend
   on the roster. The roster is a guess at a typical install, not a measurement.
+
+### Claude Code's listing budget (2026-11-05, Claude Code 2.1.281)
+
+Claude Code caps the skill listing at 1% of the model's context window in
+characters (`skillListingBudgetFraction`): 6,000 on a 200k model at 3 bytes per
+token, 30,000 on a 1M model. When the listing is over budget:
+- bundled skills keep their descriptions;
+- other skills are ranked by the user's own usage of them, and each keeps its
+  full description only if it fits in the space left. Otherwise it is listed by
+  name alone.
+
+A fresh interactive session already lists 14 bundled skills. With the shared
+description the listing came to 6,502 characters against 6,000, so the model
+saw `- impeccable` alone. That happened in a clean container and on macOS, for a
+hand-configured user and for the evals harness alike (the evals repo's capture
+diff). `-p` (print mode) lists fewer bundled skills and stays under budget.
+
+Measured by shortening the description in that session: up to about 220
+characters survives, and 225 does not. Only the Claude Code build (the `.claude`
+dist, and the plugin copied from it) gets its own description, from
+`claude-code-description` in SKILL.src.md. It is 188 characters. The build fails
+above 200 (`validateClaudeCodeDescription`). Every other provider keeps the
+shared description, because none of them has this budget.
+
+Why not shorten the shared one? On 2026-11-05 we compared the shared description
+(`current`), the 188-character text (`claude-code`), and the bare name Claude Code
+falls back to (`bare`). Three samples:
+
+| Model | current | claude-code | bare |
+|---|---|---|---|
+| Sonnet | 58/102 (57%), document 13/15 | 51/102 (50%), document 10/15 | 0/102, document 0/15 |
+| Gemini | 88/102 (86%), document 15/15 | 66/102 (65%), document 9/15 | 34/102 (33%), document 0/15 |
+
+False positives were 0/60 in every row. Shortening the shared text would cost
+Gemini 22 runs for nothing. On Claude Code the alternative was the bare name,
+which scores 0/102 on Sonnet.
+
+```bash
+ACTIVATION_VARIANTS=current,claude-code,bare ACTIVATION_SAMPLES=3 \
+  node tests/skill-behavior/activation.eval.mjs
+```
 
 This is a simulated harness, not Claude Code itself, and neither model is the
 Haiku that #744 measured. Treat it as a regression gate and a way to compare
@@ -384,7 +425,7 @@ results remain the completed measurements.
 |---|---|---|
 | 1 | empty workspace | runs `impeccable context`; loads `reference/init.md` before implementation; automation is not an init bypass |
 | 2 | PRODUCT.md only | runs `impeccable context` 1-3 times; loads `reference/new-work.md` to resolve visual authority, establish a world when needed, and develop the surface |
-| 3 | PRODUCT.md + DESIGN.md | runs `impeccable context` 1-3 times; receives the committed design system and loads `reference/new-work.md` for the task-scoped concept |
+| 3 | PRODUCT.md + DESIGN.md | runs `impeccable context` 1-3 times; receives the committed design system (as written, or for a DESIGN.md over 1,600 bytes as its map, with PRODUCT.md as whole sections up to the budget, REN-2129; Setup tells the agent to read the full file's sections the task needs) and loads `reference/new-work.md` for the task-scoped concept |
 | 4 | PRODUCT.md + DESIGN.md, context already loaded in turn 1 | turn 2 does **not** re-run `impeccable context` |
 | 5 | PRODUCT.md without the legacy `## Register` field and no DESIGN.md | runs `impeccable context`; greenfield craft loads `reference/new-work.md`, not init, to establish the missing world |
 | 6 | PRODUCT.md + DESIGN.md + a minimal `index.html`; prompt is `/impeccable polish` | loads `reference/polish.md` |
@@ -404,6 +445,9 @@ results remain the completed measurements.
 | 20 | PRODUCT.md + DESIGN.md + `index.html`; prompt is `/impeccable generate 2 bold variants of the hero heading` | loads `reference/generate.md`, and before any `live.md` read (live.md alone is the misroute) |
 | 21 | same fixture; prompt is natural language with no command word ("Show me a few quieter versions of the hero heading in the browser so I can pick one.") | infers `reference/generate.md` before any `live.md` read |
 | 22 | same fixture; prompt is `Make the hero heading bolder.` | does **not** load `reference/generate.md` (a plain refinement stays out of live); which playbook the refinement lands on is existing routing's business, not this guard's |
+| 23 | PRODUCT.md with no DESIGN.md; the craft prompt pins a world and leaves the first surface open | runs a scoped `concept-seed` roll; stops at the roll, no build |
+| 24 | one fixture per split playbook: a world redesign, a build from an approved comp, an inline web critique, a native iOS critique; each repeats `IMPECCABLE_SKILL_BEHAVIOR_LOAD_RUNS` times (default 3) | every run loads the part (`new-work-world.md`, `new-work-comp.md`, `critique-rubric.md`) before any implementation write, roll, `build-phase` or `comp-spec`; one miss fails the path |
+| 25 | empty workspace; prompt is `/impeccable init`; run signed out and signed in, each with its own `IMPECCABLE_HOME` (signed in: a stored 0600 state, no credential), stopping at the first question | `context`'s `ACCOUNT:` line matches the fixture; no `whoami` call; signed out, the text before the first question names `npx impeccable login`; signed in, sign-in is never mentioned. Skips on an engine whose `context` prints no `ACCOUNT:` line (0.1.24 and older). Measured on claude-sonnet-5 (2026-11-15): signed out 11 of 11, signed in 6 of 6; 7 of 9 signed out with the sentence in init's Step 1 |
 
 ## Setup launcher-failure branch (2026-09-06, PR #750)
 
@@ -510,6 +554,22 @@ documentation case also passes with main's unchanged `SKILL.src.md` and
 `init.md` plus this test file, so the coverage is the test, not a skill-text
 change.
 
+### Retried launcher before the notice (2026-11-17)
+
+By November the documentation case failed on claude-sonnet-5. The agent retried
+`impeccable context` once, sometimes with a no-op change such as `2>&1` or
+`--target`, and only then sent the notice. On `next` it passed 2 of 10 runs.
+Restoring only `## Setup` to its 9 Sep text passed 3 of 3. Restoring only step
+2's pre-split-playbook sentence (77651617a) also passed 3 of 3. Restoring the
+craft-floor clause (719a8fa94) passed 1 of 2 valid runs, and restoring the
+context-map parenthetical (4ef4a04fe) passed 2 of 3.
+
+The fix opens the fallback with "On the first refusal or failure, don't retry"
+and pays for it by dropping a redundant clause from step 2. The documentation
+case passed 5 of 5 alone, and failed once with a `--target` retry in one full
+scenario 19 run. That run's planning case failed on the older `polish.md` gap
+(#744). These are small samples on one model.
+
 ## Workflow-advice assertion fix (2026-09-24)
 
 On 2026-09-24 S16 and S17 failed on every provider, main included, for a test reason: the sentence-bounded matches used `[^.!?\n]`, so the dot in `index.html` ended the "sentence" and correct advice ("polish index.html to implement the fixes") could not match. A dot followed by a word character no longer ends a sentence. S16 also accepts the surface named as the landing page, this page, or the existing implementation; S17 counts a critique described as a diagnosis. Generic advice and invented critique prerequisites still fail. A live rerun on claude-sonnet-5 and gemini-3.7-flash went from 0/6 to 8/9 with the fix; the remaining case used "existing visual implementation", now accepted.
@@ -547,6 +607,15 @@ The full-build file adds end-to-end assertions for attended fresh init,
 an initialized natural build request, replacement-world redesign, scope-preserving bolder
 refinement, and critique's closing question. It checks question order and
 context/artifact writes rather than only reference-file loading.
+
+The bolder artifact check compares header text and links and footer text to the
+original fixture, with whitespace normalized. It also requires a change to the
+`#case-study` DOM or computed styles at desktop or mobile size; CSS-only changes
+are valid, while comments and unused CSS are not. This is a scope/change check,
+not a design-quality score. The existing trace and fresh-capture checks remain.
+Run its offline positive and negative cases with
+`node --test tests/skill-workflow-scope.test.mjs`; they also run in
+`bun run test:skill-workflow` before any provider-backed turns.
 
 `critique closes with the question or an explicit skip line` is a regression
 guard, not a routing check. A critique that prints its report and then stops,

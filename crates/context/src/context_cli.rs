@@ -1,9 +1,10 @@
 //! JS: context.mjs `cli()` and its directive builders.
 
 use crate::context::*;
+use crate::design_map::{self, MAP_BUDGET};
 use crate::jsp;
 use crate::provider::Provider;
-use crate::staleness::{collect_boot_findings, design_sidecar_candidates_for, BootExtras};
+use crate::staleness::{collect_boot_findings, design_sidecar_candidates_for, finding, BootExtras, Finding};
 use crate::staleness_notice::{build_staleness_directive, filter_fresh_findings, staleness_check_disabled};
 use crate::target_args::{has_target_option, parse_target_options, TargetOptions};
 use crate::util::*;
@@ -20,6 +21,7 @@ const OUTPUT_BUDGET_CHARS: usize = 24_000;
 
 pub fn hook_manifests_for(provider_id: &str) -> &'static [&'static str] {
     match provider_id {
+        "antigravity" => &[".agents/hooks.json"],
         "claude-code" => &[".claude/settings.local.json", ".claude/settings.json"],
         "codex" | "agents" => &[".codex/hooks.json"],
         "cursor" => &[".cursor/hooks.json"],
@@ -30,22 +32,63 @@ pub fn hook_manifests_for(provider_id: &str) -> &'static [&'static str] {
     }
 }
 
+/// The project skill folder `impeccable hooks on` needs before it writes this
+/// provider's manifest. `None`: that verb has no target for the provider.
+fn hooks_on_skill_folder(provider_id: &str) -> Option<&'static str> {
+    let dir = match provider_id {
+        "antigravity" => ".agent",
+        "claude-code" => ".claude",
+        "codex" | "agents" => ".agents",
+        "cursor" => ".cursor",
+        "github" => ".github",
+        "grok" => ".grok",
+        "gemini" => ".gemini",
+        _ => return None,
+    };
+    crate::hook_wiring::HOOK_MANIFEST_TARGETS.iter().find(|target| target.provider == dir).map(|target| target.skill_rel)
+}
+
+/// Claude Code's active user configuration directory. An explicit account is
+/// exclusive; a relative CLAUDE_CONFIG_DIR is resolved against the caller.
+pub fn claude_config_dir(cwd: &str, env: &Env) -> String {
+    claude_config_dir_under(cwd, env, &crate::util::homedir(env))
+}
+
+fn claude_config_dir_under(cwd: &str, env: &Env, home: &str) -> String {
+    match env_nonempty(env, "CLAUDE_CONFIG_DIR") {
+        Some(dir) => jsp::resolve(cwd, &[dir]),
+        None => jsp::join(&[home, ".claude"]),
+    }
+}
+
 /// The user-level hook manifest this provider's harness loads:
-/// Claude's `~/.claude/settings.json`; Codex and agents `$CODEX_HOME/hooks.json`
+/// Claude's `$CLAUDE_CONFIG_DIR/settings.json` (default `~/.claude`); Codex and agents `$CODEX_HOME/hooks.json`
 /// (relative to cwd), or `~/.codex/hooks.json` when CODEX_HOME is unset or
-/// empty. A non-empty CODEX_HOME is exclusive.
+/// empty. A non-empty CODEX_HOME is exclusive. Cursor's `~/.cursor/hooks.json`
+/// and Grok's personal `~/.grok/hooks/impeccable.json` (which, unlike a
+/// project hook, needs no `/hooks-trust`) are where a global install writes
+/// those providers' hooks (#1190).
 pub fn user_hook_manifest(provider_id: &str, cwd: &str, env: &Env) -> Option<String> {
+    user_hook_manifest_under(provider_id, cwd, env, &crate::util::homedir(env))
+}
+
+/// `user_hook_manifest` with the home directory given, so an installer that
+/// already resolved home writes exactly the file the readers look up.
+pub fn user_hook_manifest_under(provider_id: &str, cwd: &str, env: &Env, home: &str) -> Option<String> {
     match provider_id {
-        "claude-code" => Some(jsp::join(&[&crate::util::homedir(env), ".claude", "settings.json"])),
+        "antigravity" => Some(jsp::join(&[home, ".gemini", "config", "hooks.json"])),
+        "claude-code" => Some(jsp::join(&[&claude_config_dir_under(cwd, env, home), "settings.json"])),
         "codex" | "agents" => Some(match env_nonempty(env, "CODEX_HOME") {
             Some(root) => std::path::Path::new(cwd).join(root).join("hooks.json").to_string_lossy().into_owned(),
-            None => jsp::join(&[&crate::util::homedir(env), ".codex", "hooks.json"]),
+            None => jsp::join(&[home, ".codex", "hooks.json"]),
         }),
+        "cursor" => Some(jsp::join(&[home, ".cursor", "hooks.json"])),
+        "grok" => Some(jsp::join(&[home, ".grok", "hooks", "impeccable.json"])),
         _ => None,
     }
 }
 
-const STOP_REVIEW_PROVIDERS: [&str; 4] = ["claude-code", "codex", "agents", "grok"];
+const STOP_REVIEW_PROVIDERS: [&str; 5] = ["antigravity", "claude-code", "codex", "agents", "grok"];
 
 // Only the launcher-era design hook counts as an active automatic hook. A
 // manifest that still names the JS-era `.mjs` script (a pre-launcher install
@@ -116,8 +159,8 @@ pub fn automatic_hook_mode(ctx: &Ctx, cwd: &str, env: &Env, provider: &Provider)
         }
         for rel in manifests {
             if let Some(raw) = read_json(&jsp::join(&[&root, rel])) {
-                if let Some(h) = raw.get("hooks") {
-                    if crate::staleness::js_truthy(h) && value_has_hook_marker(h) {
+                if let Some(h) = crate::hook_markers::active_manifest_hook_subtree(&raw) {
+                    if crate::staleness::js_truthy(&h) && value_has_hook_marker(&h) {
                         return if STOP_REVIEW_PROVIDERS.contains(&provider.id.as_str()) { "stop" } else { "per-edit" };
                     }
                 }
@@ -126,9 +169,9 @@ pub fn automatic_hook_mode(ctx: &Ctx, cwd: &str, env: &Env, provider: &Provider)
     }
     if let Some(path) = user_hook_manifest(&provider.id, cwd, env) {
         if let Some(raw) = read_json(&path) {
-            if let Some(hooks) = raw.get("hooks") {
-                if crate::staleness::js_truthy(hooks) && value_has_hook_marker(hooks) {
-                    return "stop";
+            if let Some(hooks) = crate::hook_markers::active_manifest_hook_subtree(&raw) {
+                if crate::staleness::js_truthy(&hooks) && value_has_hook_marker(&hooks) {
+                    return if STOP_REVIEW_PROVIDERS.contains(&provider.id.as_str()) { "stop" } else { "per-edit" };
                 }
             }
         }
@@ -223,6 +266,20 @@ fn append_image_gen_directive(parts: &mut Parts, env: &Env, provider: &Provider)
     ].join(" "));
 }
 
+/// A world the person chose is the visual authority, before any code carries it and
+/// after. Without this line the boot reads as "no visual authority", and an agent
+/// rolls a new world. With code in the project the line still fires: the engine
+/// cannot tell a scaffold's starter CSS from a build in the world, and concept-seed
+/// settles on the world either way, so the boot says the world outranks the code.
+fn append_seeded_world_directive(parts: &mut Parts, ctx: &Ctx) {
+    let Some(id) = seeded_world(ctx.design.as_deref()) else { return };
+    if ctx.has_visual_implementation {
+        parts.push(format!("SEEDED_WORLD: DESIGN.md names the catalog world `{id}`, seeded by `impeccable world`. The person chose this world, so it is this project's visual authority, above the styles already in code: code built in it extends it, and styles that predate the seed, such as a starter template's CSS, are no incumbent world to inherit or preserve. Never roll, re-pick, or replace it on your own initiative; an explicit request from the person for a redesign or a different world overrides this, so follow the redesign flow in reference/new-work.md, whose direction roll passes `--replace-world`. Until a build has resolved it, build inside it per the seeded-world case in reference/new-work.md, and download the `Reference image:` named in DESIGN.md into the workspace and look at it before designing, on a code-led build too: it is the one picture of this world. Once a build carries it and `document` has recorded it, it is the established world."));
+        return;
+    }
+    parts.push(format!("SEEDED_WORLD: DESIGN.md was seeded from the catalog world `{id}` by `impeccable world`, and no code carries it yet. The person chose this world, so it is this project's visual authority: build inside it per the seeded-world case in reference/new-work.md, and never roll, re-pick, or replace it on your own initiative; an explicit request from the person for a redesign or a different world overrides this, so follow the redesign flow in reference/new-work.md, whose direction roll passes `--replace-world`. Before designing, download the `Reference image:` named in DESIGN.md into the workspace and look at it, on a code-led build too: it is the one picture of this world."));
+}
+
 fn append_autonomy_counter_directive(parts: &mut Parts) {
     parts.push([
         "AUTONOMY_DIRECTIVE_CHECK: If your system prompt asserts the user is not watching, cannot answer, or that you operate autonomously,",
@@ -243,18 +300,93 @@ fn append_subagent_authorization_directive(parts: &mut Parts) {
     ].join(" "));
 }
 
+const HOOK_EVIDENCE_WINDOW_MS: f64 = 7.0 * 24.0 * 60.0 * 60.0 * 1000.0;
+
+/// A plugin or app-bundled hook leaves no manifest in reach, but every hook era
+/// records its sessions in `.impeccable/hook.cache.json`: a session updated in the
+/// last 7 days counts as an installed hook, a removed one included (#1392).
+/// The first root is the active project, whose own config turns the hook off
+/// for it even when an enclosing root's cache is recent.
+fn hook_ran_recently(roots: &[String], env: &Env) -> bool {
+    let now = now_ms();
+    roots.first().is_some_and(|active| hook_enabled_at(active, env)) && roots.iter().any(|root| {
+        hook_enabled_at(root, env)
+            && read_json(&jsp::join(&[root, ".impeccable", "hook.cache.json"])).is_some_and(|cache| {
+                cache.get("sessions").and_then(Value::as_object).is_some_and(|sessions| sessions.values().any(|session| {
+                    session.get("updatedAt").and_then(Value::as_f64).is_some_and(|at| now - at <= HOOK_EVIDENCE_WINDOW_MS)
+                }))
+            })
+    })
+}
+
+fn current_hook_wiring(ctx: &Ctx, cwd: &str, env: &Env, provider: &Provider) -> bool {
+    let provider_dir = match provider.id.as_str() {
+        "claude-code" => ".claude", "codex" | "agents" => ".agents",
+        "cursor" => ".cursor", "grok" => ".grok", "github" => ".github",
+        // A plugin install resolves to `source`, so its hook shows only in the cache.
+        "source" => return hook_ran_recently(&hook_manifest_search_roots(ctx, cwd, env), env),
+        _ => return automatic_hook_mode(ctx, cwd, env, provider) != "none",
+    };
+    let target = crate::hook_wiring::HOOK_MANIFEST_TARGETS.iter().find(|t| t.provider == provider_dir).unwrap();
+    let expected = (target.manifest)();
+    let roots = hook_manifest_search_roots(ctx, cwd, env);
+    automatic_hook_mode(ctx, cwd, env, provider) != "none" &&
+        (roots.iter().any(|root|
+            hook_enabled_at(root, env) && hook_manifests_for(&provider.id).iter().any(|rel|
+                crate::hook_wiring::manifest_is_wired(&jsp::join(&[root, rel]), &expected)))
+        || user_hook_manifest(&provider.id, cwd, env).is_some_and(|path|
+            crate::hook_wiring::manifest_is_wired(&path, &expected)))
+        || hook_ran_recently(&roots, env)
+}
+
 fn append_detector_fallback(parts: &mut Parts, ctx: &Ctx, cwd: &str, env: &Env, provider: &Provider) {
-    if automatic_hook_mode(ctx, cwd, env, provider) != "none" {
+    if current_hook_wiring(ctx, cwd, env, provider) {
         return;
     }
     if is_native(ctx.platform.as_deref()) {
         return;
     }
+    let manifests = match provider.id.as_str() {
+        "claude-code" | "codex" | "agents" | "cursor" | "grok" | "github" => hook_manifests_for(&provider.id),
+        _ => &[],
+    };
+    let wiring = if manifests.is_empty() { String::new() } else {
+        format!(" Check missing or stale {} wiring with impeccable hooks status; repair with impeccable hooks on.", manifests.join(" or "))
+    };
     parts.push([
-        "MANUAL_DETECTOR_REQUIRED: No automatic Impeccable design hook is active this session.".to_string(),
-        format!("Once the changed web UI is finished, run the mechanical detector over it: `{} --json <changed targets>`.", provider.verb_cmd("detect")),
+        format!("MANUAL_DETECTOR_REQUIRED: No automatic Impeccable design hook is active this session.{wiring}"),
+        format!("Once the changed web UI is finished, run the mechanical detector over it: {} (without git, pass the changed files instead of `--changed`).", changed_detect_command(ctx, cwd, provider)),
         "Run it once, and not earlier during concept selection.".to_string(),
     ].join(" "));
+}
+
+/// `--changed` scans only cwd's subtree, so when context resolved a project
+/// other than cwd (an explicit `--target`, or a session started below or
+/// beside the project) the directive names the directory to run it from.
+/// The command then runs from that directory, so a launcher invoked by a
+/// relative path is spelled absolute against cwd.
+fn changed_detect_command(ctx: &Ctx, cwd: &str, provider: &Provider) -> String {
+    let same = |a: &str, b: &str| {
+        let canon = |p: &str| std::fs::canonicalize(p).map(|c| c.to_string_lossy().into_owned()).unwrap_or_else(|_| p.trim_end_matches(['/', '\\']).to_string());
+        canon(a) == canon(b)
+    };
+    if ctx.project_root.is_empty() || same(&ctx.project_root, cwd) {
+        return format!("`{} --json --changed`", provider.verb_cmd("detect"));
+    }
+    let raw = provider.self_raw.as_str();
+    let has_dir = raw.contains('/') || (cfg!(windows) && raw.contains('\\'));
+    let self_cmd = if has_dir && !jsp::is_absolute(raw) {
+        let resolved = jsp::resolve(cwd, &[raw]);
+        if !impeccable_common::launcher::is_cmd_launcher(&resolved) && resolved.chars().any(char::is_whitespace) {
+            // The cwd made this path absolute, so a space in it is new.
+            shell_arg(&resolved)
+        } else {
+            impeccable_common::launcher::spell_self(&resolved)
+        }
+    } else {
+        provider.self_cmd.clone()
+    };
+    format!("`{self_cmd} detect --json --changed` from `{}`", ctx.project_root)
 }
 
 /// `which <tool>` exit 0 (`where` on Windows).
@@ -301,7 +433,79 @@ fn project_roots_diagnostic(ctx: &Ctx, options: &TargetOptions, env: &Env) -> (O
     (Some(patterns), cands)
 }
 
-fn append_staleness_directive(parts: &mut Parts, ctx: &Ctx, options: &TargetOptions, cwd: &str, env: &Env) {
+/// True when the project's config records the design hook as declined at the
+/// install prompt (`hook.consent: "declined"`).
+fn hook_consent_declined_at(root: &str) -> bool {
+    let mut declined = false;
+    for name in [".impeccable/config.json", ".impeccable/config.local.json"] {
+        if let Some(raw) = read_json(&jsp::join(&[root, name])) {
+            if let Some(consent) = raw.get("hook").and_then(|h| h.get("consent")).and_then(|c| c.as_str()) {
+                if consent == "accepted" || consent == "declined" {
+                    declined = consent == "declined";
+                }
+            }
+        }
+    }
+    declined
+}
+
+/// The `hook-not-installed` finding: this harness has a hook surface, the
+/// project is web, nothing has turned the hook off or declined it, and no
+/// manifest in reach (the project walk or the user-level file) carries an
+/// Impeccable hook of any era. A manifest of any era counts as installed so a
+/// stale one stays with `hook-script-missing` and Cursor's retired gate with
+/// `cursor-hook-pre-edit-gate`, each with its own fix. Shared by the boot
+/// directive and doctor so both report the same state.
+pub fn check_hook_not_installed(ctx: &Ctx, cwd: &str, env: &Env, provider: &Provider) -> Vec<Finding> {
+    let manifests = hook_manifests_for(&provider.id);
+    if manifests.is_empty() || is_native(ctx.platform.as_deref()) {
+        return vec![];
+    }
+    let active_root = jsp::resolve(if ctx.project_root.is_empty() { cwd } else { &ctx.project_root }, &[]);
+    if !hook_enabled_at(&active_root, env) || hook_consent_declined_at(&active_root) {
+        return vec![];
+    }
+    let roots = hook_manifest_search_roots(ctx, cwd, env);
+    let mut paths: Vec<String> = roots.iter().flat_map(|root| manifests.iter().map(move |rel| jsp::join(&[root, rel]))).collect();
+    paths.extend(user_hook_manifest(&provider.id, cwd, env));
+    let installed = paths.iter().any(|p| {
+        // Gemini's settings file may carry comments, and `hooks on` reads it the same way.
+        safe_read(p)
+            .and_then(|text| crate::hook_markers::parse_manifest_jsonc(&text))
+            .and_then(|(raw, _)| crate::hook_markers::active_manifest_hook_subtree(&raw))
+            .map(|hooks| crate::staleness::js_truthy(&hooks) && crate::hook_markers::value_has_impeccable_hook_marker(&hooks))
+            .unwrap_or(false)
+    });
+    if installed || hook_ran_recently(&roots, env) {
+        return vec![];
+    }
+    // `hooks on` writes a manifest only beside a skill folder in the directory
+    // it runs in, so a skill folder further up the selected project's roots
+    // names that directory. With none, it wires a user-level Claude launcher
+    // from any directory; any other user-level skill gets its hook back from
+    // `update`.
+    let abs_cwd = jsp::resolve(cwd, &[]);
+    let skill_root = hooks_on_skill_folder(&provider.id)
+        .and_then(|rel| roots.iter().find(|root| exists(&jsp::join(&[root, rel]))));
+    let user_launcher = provider.id == "claude-code"
+        && exists(&jsp::join(&[&claude_config_dir(cwd, env), "skills", "impeccable", "scripts", "impeccable"]));
+    let install = match skill_root {
+        Some(root) if *root == abs_cwd => "`impeccable hooks on` to install it".to_string(),
+        Some(root) => format!("`impeccable hooks on` from `{}`, where the skill is installed, to install it", jsp::relative(&abs_cwd, &abs_cwd, root)),
+        None if user_launcher => "`impeccable hooks on` to install it".to_string(),
+        None => "`impeccable update` to reinstall it".to_string(),
+    };
+    vec![finding(
+        "hook-not-installed",
+        "hook manifest",
+        Some(manifests[0].to_string()),
+        "route",
+        "No Impeccable design hook is installed for this project, so UI edits are not reviewed as they land.".to_string(),
+        format!("Run {install}, or `impeccable hooks off` to keep it off and stop this finding."),
+    )]
+}
+
+fn append_staleness_directive(parts: &mut Parts, ctx: &Ctx, options: &TargetOptions, cwd: &str, env: &Env, provider: &Provider) {
     let project_root = if ctx.project_root.is_empty() { cwd.to_string() } else { ctx.project_root.clone() };
     if staleness_check_disabled(env, &[Some(&project_root), Some(&ctx.repo_root)]) {
         return;
@@ -314,9 +518,10 @@ fn append_staleness_directive(parts: &mut Parts, ctx: &Ctx, options: &TargetOpti
         project_root_patterns: patterns,
         target_candidates: cands,
     };
-    let findings = collect_boot_findings(ctx, cwd, &extras);
+    let mut findings = collect_boot_findings(ctx, cwd, &extras);
+    findings.extend(check_hook_not_installed(ctx, cwd, env, provider));
     let fresh = filter_fresh_findings(env, findings, &project_root, now_ms());
-    if let Some(d) = build_staleness_directive(&fresh) {
+    if let Some(d) = build_staleness_directive(&fresh, &provider.command) {
         parts.push(d);
     }
 }
@@ -563,10 +768,11 @@ fn fetch_latest_skill_version(env: &Env) -> Option<String> {
         .cloned()
         .unwrap_or_else(|| "https://impeccable.style".to_string());
     let host = host.strip_suffix('/').unwrap_or(&host).to_string();
-    let agent = crate::http::agent_builder()
+    let url = format!("{}/api/version", host);
+    let agent = crate::http::agent_builder(&url)
         .timeout(std::time::Duration::from_millis(FETCH_TIMEOUT_MS))
         .build();
-    let res = agent.get(&format!("{}/api/version", host)).call().ok()?;
+    let res = agent.get(&url).call().ok()?;
     if res.status() < 200 || res.status() >= 300 {
         return None;
     }
@@ -666,6 +872,27 @@ fn load_native_platform_references(platform: Option<&str>, provider: &Provider) 
 // ─── cli ───────────────────────────────────────────────────────────────────
 
 pub fn run(args: &[String], io: &mut Io) -> i32 {
+    run_with_hook_repair(args, io, &mut |_| Ok(None))
+}
+
+/// The CLI supplies hook maintenance to avoid a context -> hook dependency cycle.
+pub fn run_with_hook_repair(
+    args: &[String], io: &mut Io,
+    repair: &mut dyn FnMut(&str) -> Result<Option<String>, String>,
+) -> i32 {
+    if args.iter().enumerate().any(|(i, a)| matches!(a.as_str(), "--help" | "-h")
+        && (i == 0 || !matches!(args[i - 1].as_str(), "--target" | "-t" | "--command" | "--focus"))) {
+        io.out("Usage: impeccable context [--target <path>] [--command <verb>] [--focus web|slides|motion]\nRead project context and cached taste for the surface; --command animate selects motion taste.\n");
+        return 0;
+    }
+    if let Err(message) = crate::taste::explicit_focus(args) {
+        io.err(&format!("{message}\n"));
+        return 1;
+    }
+    if args.iter().enumerate().any(|(i, a)| a == "--command" && args.get(i + 1).is_none_or(|v| v.is_empty() || v.starts_with('-')) || a == "--command=") {
+        io.err("--command requires a verb.\n");
+        return 1;
+    }
     let cwd = io.cwd.to_string_lossy().into_owned();
     let env = io.env.clone();
     let provider = crate::provider::detect(&env, &cwd);
@@ -701,11 +928,31 @@ pub fn run(args: &[String], io: &mut Io) -> i32 {
         None => options.clone(),
     };
     let ctx = load_context(&cwd, &load_options, &env);
+    if !is_native(ctx.platform.as_deref()) && hook_enabled_at(&ctx.project_root, &env) {
+        let mut notices = Vec::new();
+        for root in hook_manifest_search_roots(&ctx, &cwd, &env) {
+            match repair(&root) {
+                Ok(Some(message)) => notices.push(message),
+                Err(error) => notices.push(format!("Impeccable hook wiring repair failed: {error}; run impeccable hooks on.")),
+                _ => {}
+            }
+        }
+        if !notices.is_empty() {
+            io.out(&format!("{}\n", notices.join(" ")));
+        }
+    }
     let update_directive = compute_update_directive(&cwd, &env, &provider);
     let cmd = &provider.command;
 
     if !ctx.has_product {
-        let lines = if ctx.has_visual_implementation {
+        let lines = if ctx.has_visual_implementation && seeded_world(ctx.design.as_deref()).is_some() {
+            // The seeded world below outranks the code, so the boot never calls
+            // that code the incumbent authority.
+            vec![
+                format!("NO_PRODUCT_MD: This project has no PRODUCT.md yet. Its DESIGN.md names the seeded world below, and the styles in code do not outrank it. For `init`, `teach`, `shape`, or any request to create a new surface, load reference/init.md and create PRODUCT.md with the user first; then reference/new-work.md builds the surface inside the seeded world. Other narrow refinement commands may proceed against the existing code without blocking, then offer `{} init` as a follow-up.", cmd),
+                "BUILD_INIT_REQUIRED: Before shape or any new-surface/redesign flow, init must capture PRODUCT.md with the human or structured simulated user. Init writes product truth only; reference/new-work.md owns every visual decision.".to_string(),
+            ]
+        } else if ctx.has_visual_implementation {
             vec![
                 format!("NO_PRODUCT_MD: This project has no PRODUCT.md yet, but it does have an incumbent visual implementation. For `init`, `teach`, `shape`, or any request to create a new surface or replacement visual world, load reference/init.md and create PRODUCT.md with the user first. After init writes PRODUCT.md, reference/new-work.md preserves and documents the incumbent system for an extension or replaces it with the user for a redesign/rebrand. Other narrow refinement commands may read the CSS, tokens, components, and assets and proceed without blocking, then offer `{} init` as a follow-up.", cmd),
                 "BUILD_INIT_REQUIRED: Before shape or any new-surface/redesign flow, init must capture PRODUCT.md with the human or structured simulated user. Init writes product truth only; reference/new-work.md owns every visual decision.".to_string(),
@@ -715,13 +962,18 @@ pub fn run(args: &[String], io: &mut Io) -> i32 {
         } else {
             vec![
                 format!("NO_PRODUCT_MD: This project has no PRODUCT.md yet. For `init`, `teach`, `shape`, or wording that clearly maps to a from-scratch build/shape flow, load reference/init.md, complete its human or structured simulated-user interview, and write PRODUCT.md before designing. If no answer mechanism truly exists, init may infer only from the explicit brief and must label its assumptions. It never writes DESIGN.md. For any other (scoped) command against existing code, proceed using the code as context and offer `{} init` as a suggestion (do not block).", cmd),
-                "PRODUCT_INIT_REQUIRED: No product context or visual authority was found. New builds and redesigns must finish reference/init.md for PRODUCT.md, then reference/new-work.md establishes the world and surface. Scoped fixes to existing code do not need the new-surface flow.".to_string(),
+                if seeded_world(ctx.design.as_deref()).is_some() {
+                    "PRODUCT_INIT_REQUIRED: No product context was found. New builds must finish reference/init.md for PRODUCT.md, which writes product truth only; then reference/new-work.md builds the surface inside the seeded world below.".to_string()
+                } else {
+                    "PRODUCT_INIT_REQUIRED: No product context or visual authority was found. New builds and redesigns must finish reference/init.md for PRODUCT.md, then reference/new-work.md establishes the world and surface. Scoped fixes to existing code do not need the new-surface flow.".to_string()
+                },
             ]
         };
         let mut parts = Parts(lines.into_iter().map(Part::Text).collect());
         if ctx.has_design {
-            parts.doc("# DESIGN.md".to_string(), ctx.design_path.as_deref().unwrap_or_default(), ctx.design.as_deref().unwrap_or_default());
+            append_design(&mut parts, &ctx, &provider, resolved_target_path.as_deref());
         }
+        append_seeded_world_directive(&mut parts, &ctx);
         append_surface_brief_context(&mut parts, &ctx, &provider);
         append_resolved_context(&mut parts, &ctx, &options, target_exists, &provider);
         append_detector_fallback(&mut parts, &ctx, &cwd, &env, &provider);
@@ -733,18 +985,20 @@ pub fn run(args: &[String], io: &mut Io) -> i32 {
             parts.push(build_missing_target_directive(&provider));
         }
         append_image_tools_directive(&mut parts, &env);
-        append_staleness_directive(&mut parts, &ctx, &options, &cwd, &env);
+        append_staleness_directive(&mut parts, &ctx, &options, &cwd, &env, &provider);
         if let Some(u) = update_directive {
             parts.push(u);
         }
+        append_taste(&mut parts, &env, crate::taste::focus(args, &ctx));
         io.out(&parts.render());
         return 0;
     }
     let mut parts = Parts::default();
-    parts.doc("# PRODUCT.md".to_string(), ctx.product_path.as_deref().unwrap_or_default(), ctx.product.as_deref().unwrap_or_default());
+    append_product(&mut parts, &ctx);
     if ctx.has_design {
-        parts.doc("# DESIGN.md".to_string(), ctx.design_path.as_deref().unwrap_or_default(), ctx.design.as_deref().unwrap_or_default());
+        append_design(&mut parts, &ctx, &provider, resolved_target_path.as_deref());
     }
+    append_seeded_world_directive(&mut parts, &ctx);
     append_surface_brief_context(&mut parts, &ctx, &provider);
     append_resolved_context(&mut parts, &ctx, &options, target_exists, &provider);
     append_detector_fallback(&mut parts, &ctx, &cwd, &env, &provider);
@@ -766,7 +1020,7 @@ pub fn run(args: &[String], io: &mut Io) -> i32 {
         parts.doc(format!("# NATIVE PLATFORM REFERENCE: {} (reference/{}.md)", name.to_uppercase(), name), &path, &content);
     }
     append_image_tools_directive(&mut parts, &env);
-    append_staleness_directive(&mut parts, &ctx, &options, &cwd, &env);
+    append_staleness_directive(&mut parts, &ctx, &options, &cwd, &env, &provider);
     if ctx.platform.is_none() {
         if let Some(raw) = extract_section_value(ctx.product.as_deref(), "Platform") {
             if !raw.is_empty() {
@@ -777,8 +1031,115 @@ pub fn run(args: &[String], io: &mut Io) -> i32 {
     if let Some(u) = update_directive {
         parts.push(u);
     }
+    append_taste(&mut parts, &env, crate::taste::focus(args, &ctx));
     io.out(&parts.render());
     0
+}
+
+/// DESIGN.md as written, or past the map budget, its map with the path to the full file and the lookup that answers
+/// what the map leaves out.
+fn append_design(parts: &mut Parts, ctx: &Ctx, provider: &Provider, target: Option<&str>) {
+    let path = ctx.design_path.as_deref().unwrap_or_default();
+    let design = ctx.design.as_deref().unwrap_or_default();
+    if js_trim(design).len() <= MAP_BUDGET {
+        parts.doc("# DESIGN.md".to_string(), path, design);
+        return;
+    }
+    // The workspace `context` was given goes with it, or the lookup would read another DESIGN.md.
+    let workspace = target.map(|t| format!(" --target {}", shell_arg(t))).unwrap_or_default();
+    let lookup = format!("Lookup: `{}{workspace} <term>` prints one token, component or section, with its file.", provider.verb_cmd("design-lookup"));
+    // Already its map (`design-compact`): the body as written, within the map's own cap; mapping it again would lose
+    // its rules and the pointer to the original.
+    if let Some(at) = design.find(design_map::MAP_MARKER) {
+        let body = design[at + design_map::MAP_MARKER.len()..].trim();
+        let body: String = body.chars().take(design_map::MAP_SIZE).collect();
+        parts.push(format!("# DESIGN.md (map; {path})\n\n{body}\n{lookup}"));
+        return;
+    }
+    let root = std::path::Path::new(ctx.design_context_dir.as_deref().unwrap_or("."));
+    parts.push(format!("# DESIGN.md (map; full file: {path})\n\n{}\n{lookup}", design_map::map(design, root, path)));
+}
+
+/// PRODUCT.md as written, or past the map budget, whole sections up to it: the title and first section, then the
+/// anti-references (the guardrails a design most often breaks), then the rest in order while they fit, and the names
+/// of any that don't with the path to them.
+fn append_product(parts: &mut Parts, ctx: &Ctx) {
+    let path = ctx.product_path.as_deref().unwrap_or_default();
+    let product = js_trim(ctx.product.as_deref().unwrap_or_default());
+    if product.len() <= MAP_BUDGET {
+        parts.doc("# PRODUCT.md".to_string(), path, product);
+        return;
+    }
+    // The title (anything before the first `## `), then each `## ` section whole.
+    let mut sections: Vec<String> = vec![String::new()];
+    for line in product.lines() {
+        if line.starts_with("## ") {
+            sections.push(String::new());
+        }
+        let last = sections.last_mut().expect("one section");
+        last.push_str(line);
+        last.push('\n');
+    }
+    let name = |s: &str| s.lines().next().and_then(|l| l.strip_prefix("## ")).unwrap_or("").trim().to_string();
+    let mut order: Vec<usize> = vec![0];
+    if sections.len() > 1 {
+        order.push(1);
+    }
+    if let Some(at) = (2..sections.len()).find(|&i| name(&sections[i]).to_lowercase().contains("anti-reference")) {
+        order.push(at);
+    }
+    let later: Vec<usize> = (2..sections.len()).filter(|i| !order.contains(i)).collect();
+    order.extend(later);
+    let (mut kept, mut left, mut used) = (vec![false; sections.len()], Vec::new(), 0);
+    for (n, &i) in order.iter().enumerate() {
+        // The title and first section always go, so the file is never reduced to its name alone.
+        if n < 2 || used + sections[i].len() <= MAP_BUDGET {
+            used += sections[i].len();
+            kept[i] = true;
+        } else {
+            left.push(name(&sections[i]));
+        }
+    }
+    let mut text = js_trim(&(0..sections.len()).filter(|&i| kept[i]).map(|i| sections[i].as_str()).collect::<String>()).to_string();
+    // A title or first section that is itself long is cut at a line within the budget, so no PRODUCT.md can push the
+    // directives after it past an agent's output limit.
+    if text.len() > MAP_BUDGET * 2 {
+        let mut cut = 0;
+        for (at, _) in text.match_indices('\n') {
+            if at > MAP_BUDGET * 2 {
+                break;
+            }
+            cut = at;
+        }
+        if cut == 0 {
+            cut = MAP_BUDGET * 2;
+            while !text.is_char_boundary(cut) {
+                cut -= 1;
+            }
+        }
+        text.truncate(cut);
+        text.push_str("\n(cut here; the rest is in the full file)");
+    }
+    if !left.is_empty() {
+        text.push_str(&format!("\n\nMore sections: {}.", left.join(", ")));
+    }
+    parts.push(format!("# PRODUCT.md (sections; full file: {path})\n\n{text}\nFull: {path} (read a section when you need its detail)"));
+}
+
+fn append_taste(parts: &mut Parts, env: &Env, focus: Option<&str>) {
+    if let Some(block) = crate::taste::block_for(env, focus) {
+        insert_taste(parts, block);
+    }
+}
+
+fn insert_taste(parts: &mut Parts, block: String) {
+    let index = parts.0.iter().position(|p| {
+        let text = p.text();
+        text.starts_with("# PRODUCT.md") || text.starts_with("# DESIGN.md")
+            || text.starts_with("# SURFACE BRIEF ")
+            || text.starts_with("# NATIVE PLATFORM REFERENCE:")
+    }).unwrap_or(parts.0.len());
+    parts.0.insert(index, Part::Text(block));
 }
 
 /// One part of the context output.
@@ -842,6 +1203,30 @@ impl Parts {
 #[cfg(test)]
 mod skill_version_tests {
     use super::parse_skill_frontmatter_version as v;
+    use super::{insert_taste, Part, Parts};
+
+    #[test]
+    fn taste_preserves_sized_directives_and_document_order() {
+        let mut parts = Parts::default();
+        parts.push("FIRST".into());
+        parts.sized("RESOLVED_CONTEXT: full".into(), "RESOLVED_CONTEXT: compact".into());
+        parts.sized("SURFACE_CONTEXT_AVAILABLE: full".into(), "SURFACE_CONTEXT_AVAILABLE: compact".into());
+        parts.doc("# PRODUCT.md".into(), "PRODUCT.md", "product");
+        parts.push("TAIL".into());
+        insert_taste(&mut parts, "TASTE".into());
+        assert_eq!(parts.0.iter().map(Part::text).collect::<Vec<_>>(), vec![
+            "FIRST", "RESOLVED_CONTEXT: full", "SURFACE_CONTEXT_AVAILABLE: full",
+            "TASTE", "# PRODUCT.md\n\nproduct", "TAIL",
+        ]);
+        let mut parts = Parts::default();
+        parts.sized("DIRECTIVE".into(), "compact".into());
+        insert_taste(&mut parts, "TASTE".into());
+        assert_eq!(parts.0.iter().map(Part::text).collect::<Vec<_>>(), vec!["DIRECTIVE", "TASTE"]);
+        let mut parts = Parts::default();
+        parts.push("# DESIGN.md (map; full file: DESIGN.md)\n\nmap".into());
+        insert_taste(&mut parts, "TASTE".into());
+        assert_eq!(parts.0[0].text(), "TASTE");
+    }
 
     /// Values recorded from origin/main's `parseSkillFrontmatterVersion` (#703).
     #[test]
@@ -1069,13 +1454,29 @@ mod user_scope_hook_tests {
 
     #[test]
     fn other_providers_do_not_borrow_codex_user_hooks() {
-        for provider in ["source", "cursor", "gemini", "claude-code"] {
+        for provider in ["source", "cursor", "grok", "gemini", "claude-code"] {
             let mut fixture = UserHookFixture::new(provider);
             fixture.put("home/.codex/hooks.json", CODEX_HOOK);
             fixture.put("custom-home/hooks.json", CODEX_HOOK);
             fixture.env.insert("CODEX_HOME".to_string(), fixture.root.join("custom-home").to_string_lossy().into_owned());
             assert_eq!(fixture.mode(), "none", "{provider}");
         }
+    }
+
+    #[test]
+    fn cursor_and_grok_user_hooks_supply_automatic_hook_coverage() {
+        // #1190: a global install writes these, so `context` must see them.
+        let fixture = UserHookFixture::new("cursor");
+        fixture.put("home/.cursor/hooks.json", r#"{"version":1,"hooks":{"postToolUse":[{"command":"\"/skills/impeccable/scripts/impeccable\" hook","matcher":"^Write$"}]}}"#);
+        assert_eq!(fixture.mode(), "per-edit");
+        let fixture = UserHookFixture::new("grok");
+        fixture.put("home/.grok/hooks/impeccable.json", CODEX_HOOK);
+        assert_eq!(fixture.mode(), "stop");
+        // Neither borrows the other's, nor Codex's.
+        let fixture = UserHookFixture::new("cursor");
+        fixture.put("home/.grok/hooks/impeccable.json", CODEX_HOOK);
+        fixture.put("home/.codex/hooks.json", CODEX_HOOK);
+        assert_eq!(fixture.mode(), "none");
     }
 
     #[test]
@@ -1299,5 +1700,391 @@ mod worktree_hook_tests {
         std::fs::write(&manifest, r#"{"version":1,"hooks":{"preToolUse":[{"command":"\".cursor/skills/impeccable/scripts/impeccable\" hook-before-edit","timeout":5}]}}"#).unwrap();
         assert_eq!(mode(), "per-edit");
         let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
+#[cfg(test)]
+mod hook_not_installed_tests {
+    use super::check_hook_not_installed;
+    use crate::context::load_context;
+    use crate::staleness::Finding;
+    use crate::target_args::TargetOptions;
+    use crate::util::Env;
+    use std::path::PathBuf;
+
+    const LAUNCHER_HOOK: &str = r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"\"/skills/impeccable/scripts/impeccable\" hook"}]}]}}"#;
+    const LEGACY_HOOK: &str = r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"node \"/skills/impeccable/scripts/hook.mjs\""}]}]}}"#;
+    const CURSOR_GATE: &str = r#"{"hooks":{"preToolUse":[{"command":"\"/skills/impeccable/scripts/impeccable\" hook-before-edit"}]}}"#;
+
+    struct Fixture {
+        root: PathBuf,
+        project: String,
+        env: Env,
+    }
+
+    impl Fixture {
+        fn new(provider: &str) -> Self {
+            // A counter, not the clock: tests run in parallel and two that
+            // start in the same tick would share a root.
+            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let root = std::env::temp_dir().join(format!(
+                "impeccable-hook-not-installed-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            let project = root.join("project");
+            let home = root.join("home");
+            std::fs::create_dir_all(project.join(".git")).unwrap();
+            std::fs::create_dir_all(&home).unwrap();
+            let env = Env::from([
+                ("HOME".to_string(), home.to_string_lossy().into_owned()),
+                ("USERPROFILE".to_string(), home.to_string_lossy().into_owned()),
+                ("IMPECCABLE_PROVIDER_ID".to_string(), provider.to_string()),
+            ]);
+            Self { root, project: project.to_string_lossy().into_owned(), env }
+        }
+
+        fn put(&self, path: &str, body: &str) {
+            let path = self.root.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        }
+
+        fn findings(&self) -> Vec<Finding> {
+            let ctx = load_context(&self.project, &TargetOptions::default(), &self.env);
+            let provider = crate::provider::detect(&self.env, &self.project);
+            check_hook_not_installed(&ctx, &self.project, &self.env, &provider)
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn fires_for_a_hook_surface_with_no_manifest_in_reach() {
+        let fixture = Fixture::new("claude-code");
+        let found = fixture.findings();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, "hook-not-installed");
+        assert_eq!(found[0].severity, "route");
+        assert_eq!(found[0].path.as_deref(), Some(".claude/settings.local.json"));
+        assert!(found[0].fix.contains("`impeccable update`"), "{}", found[0].fix);
+    }
+
+    #[test]
+    fn names_hooks_on_only_where_that_verb_installs() {
+        for (provider, skill, hooks_on) in [
+            ("claude-code", "project/.claude/skills/impeccable/SKILL.md", true),
+            ("codex", "project/.agents/skills/impeccable/SKILL.md", true),
+            ("grok", "project/.grok/skills/impeccable/SKILL.md", true),
+            ("claude-code", "home/.claude/skills/impeccable/scripts/impeccable", true),
+            ("claude-code", "home/.claude/skills/impeccable/SKILL.md", false),
+            ("codex", "home/.agents/skills/impeccable/scripts/impeccable", false),
+        ] {
+            let fixture = Fixture::new(provider);
+            fixture.put(skill, "");
+            let fix = fixture.findings().remove(0).fix;
+            assert_eq!(fix.contains("`impeccable hooks on`"), hooks_on, "{provider} {skill}: {fix}");
+            assert_eq!(fix.contains("`impeccable update`"), !hooks_on, "{provider} {skill}: {fix}");
+        }
+    }
+
+    #[test]
+    fn names_the_folder_to_run_hooks_on_from_when_the_skill_sits_above_cwd() {
+        let fixture = Fixture::new("claude-code");
+        fixture.put("project/.claude/skills/impeccable/SKILL.md", "");
+        let nested = fixture.root.join("project").join("web");
+        std::fs::create_dir_all(&nested).unwrap();
+        let cwd = nested.to_string_lossy().into_owned();
+        let ctx = load_context(&cwd, &TargetOptions::default(), &fixture.env);
+        let provider = crate::provider::detect(&fixture.env, &cwd);
+        let fix = check_hook_not_installed(&ctx, &cwd, &fixture.env, &provider).remove(0).fix;
+        assert!(fix.contains("`impeccable hooks on` from `..`, where the skill is installed"), "{fix}");
+    }
+
+    #[test]
+    fn a_skill_beside_the_caller_is_not_offered_for_another_target() {
+        let fixture = Fixture::new("claude-code");
+        fixture.put("project/.claude/skills/impeccable/SKILL.md", "");
+        fixture.put("other/.git/HEAD", "");
+        let options = TargetOptions { target_path: Some(fixture.root.join("other").to_string_lossy().into_owned()), ..Default::default() };
+        let fix = || {
+            let ctx = load_context(&fixture.project, &options, &fixture.env);
+            let provider = crate::provider::detect(&fixture.env, &fixture.project);
+            check_hook_not_installed(&ctx, &fixture.project, &fixture.env, &provider).remove(0).fix
+        };
+        assert!(fix().contains("`impeccable update`"), "{}", fix());
+        fixture.put("other/.claude/skills/impeccable/SKILL.md", "");
+        // The folder is spelled with the platform's separator.
+        let from = format!("`impeccable hooks on` from `..{}other`, where the skill is installed", std::path::MAIN_SEPARATOR);
+        assert!(fix().contains(&from), "{}", fix());
+    }
+
+    #[test]
+    fn a_commented_manifest_still_counts_as_installed() {
+        let fixture = Fixture::new("gemini");
+        fixture.put("project/.gemini/settings.json", &format!("// my settings\n{LAUNCHER_HOOK}"));
+        assert!(fixture.findings().is_empty());
+    }
+
+    #[test]
+    fn a_manifest_of_either_era_counts_as_installed() {
+        for (provider, path, body) in [
+            ("claude-code", "project/.claude/settings.local.json", LAUNCHER_HOOK),
+            ("claude-code", "project/.claude/settings.json", LEGACY_HOOK),
+            ("cursor", "project/.cursor/hooks.json", CURSOR_GATE),
+            ("gemini", "project/.gemini/settings.json", LAUNCHER_HOOK),
+            ("codex", "home/.codex/hooks.json", LAUNCHER_HOOK),
+            ("claude-code", "home/.claude/settings.json", LAUNCHER_HOOK),
+        ] {
+            let fixture = Fixture::new(provider);
+            fixture.put(path, body);
+            assert!(fixture.findings().is_empty(), "{provider} {path}");
+        }
+    }
+
+    #[test]
+    fn a_manifest_at_an_enclosing_git_root_counts() {
+        let fixture = Fixture::new("claude-code");
+        let nested = fixture.root.join("project").join("web");
+        std::fs::create_dir_all(&nested).unwrap();
+        fixture.put("project/.claude/settings.local.json", LAUNCHER_HOOK);
+        let cwd = nested.to_string_lossy().into_owned();
+        let ctx = load_context(&cwd, &TargetOptions::default(), &fixture.env);
+        let provider = crate::provider::detect(&fixture.env, &cwd);
+        assert!(check_hook_not_installed(&ctx, &cwd, &fixture.env, &provider).is_empty());
+    }
+
+    #[test]
+    fn a_hook_session_in_the_last_week_counts_as_installed() {
+        // A plugin or app-bundled hook has no manifest in reach; its cache is the evidence (#1392).
+        let day = 24.0 * 60.0 * 60.0 * 1000.0;
+        for (age_days, installed) in [(1.0, true), (8.0, false)] {
+            let fixture = Fixture::new("codex");
+            let at = (crate::util::now_ms() - age_days * day) as u64;
+            fixture.put("project/.impeccable/hook.cache.json", &format!(r#"{{"version":1,"sessions":{{"s":{{"updatedAt":{at},"files":{{}}}}}}}}"#));
+            assert_eq!(fixture.findings().is_empty(), installed, "{age_days} days");
+            let ctx = load_context(&fixture.project, &TargetOptions::default(), &fixture.env);
+            let provider = crate::provider::detect(&fixture.env, &fixture.project);
+            let mut parts = super::Parts::default();
+            super::append_detector_fallback(&mut parts, &ctx, &fixture.project, &fixture.env, &provider);
+            assert_eq!(!parts.render().contains("MANUAL_DETECTOR_REQUIRED"), installed, "{age_days} days");
+            // A hook turned off since still needs the manual detector.
+            fixture.put("project/.impeccable/config.local.json", r#"{"hook":{"enabled":false}}"#);
+            let mut parts = super::Parts::default();
+            super::append_detector_fallback(&mut parts, &ctx, &fixture.project, &fixture.env, &provider);
+            assert!(parts.render().contains("MANUAL_DETECTOR_REQUIRED"), "{age_days} days, disabled");
+        }
+    }
+
+    fn recent_cache() -> String {
+        format!(r#"{{"version":1,"sessions":{{"s":{{"updatedAt":{},"files":{{}}}}}}}}"#, crate::util::now_ms() as u64)
+    }
+
+    fn manual_detector_required(fixture: &Fixture, cwd: &str) -> bool {
+        let ctx = load_context(cwd, &TargetOptions::default(), &fixture.env);
+        let provider = crate::provider::detect(&fixture.env, cwd);
+        let mut parts = super::Parts::default();
+        super::append_detector_fallback(&mut parts, &ctx, cwd, &fixture.env, &provider);
+        parts.render().contains("MANUAL_DETECTOR_REQUIRED")
+    }
+
+    #[test]
+    fn a_plugin_install_counts_its_recent_cache() {
+        let fixture = Fixture::new("source");
+        assert!(manual_detector_required(&fixture, &fixture.project));
+        fixture.put("project/.impeccable/hook.cache.json", &recent_cache());
+        assert!(!manual_detector_required(&fixture, &fixture.project));
+    }
+
+    #[test]
+    fn an_enclosing_cache_does_not_cover_a_project_with_the_hook_off() {
+        let fixture = Fixture::new("codex");
+        fixture.put("project/.impeccable/hook.cache.json", &recent_cache());
+        fixture.put("project/web/package.json", r#"{"name":"web"}"#);
+        fixture.put("project/web/.impeccable/config.local.json", r#"{"hook":{"enabled":false}}"#);
+        let web = fixture.root.join("project").join("web").to_string_lossy().into_owned();
+        assert_eq!(load_context(&web, &TargetOptions::default(), &fixture.env).project_root, web);
+        assert!(manual_detector_required(&fixture, &web));
+    }
+
+    #[test]
+    fn silent_when_the_hook_is_off_or_declined() {
+        for config in [r#"{"hook":{"enabled":false}}"#, r#"{"hook":{"consent":"declined"}}"#] {
+            let fixture = Fixture::new("claude-code");
+            fixture.put("project/.impeccable/config.local.json", config);
+            assert!(fixture.findings().is_empty(), "{config}");
+        }
+        let mut fixture = Fixture::new("claude-code");
+        fixture.env.insert("IMPECCABLE_HOOK_DISABLED".to_string(), "1".to_string());
+        assert!(fixture.findings().is_empty());
+    }
+
+    #[test]
+    fn silent_where_there_is_nothing_to_install() {
+        // No hook surface for this harness (a plugin or source checkout
+        // resolves to `source`), and native projects have no web hook.
+        for provider in ["source", "kiro", "hermes"] {
+            assert!(Fixture::new(provider).findings().is_empty(), "{provider}");
+        }
+        let fixture = Fixture::new("claude-code");
+        fixture.put("project/PRODUCT.md", "# App\n\n## Platform\n\nios\n");
+        assert!(fixture.findings().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod wiring_fallback_tests {
+    #[test]
+    fn gemini_does_not_offer_to_repair_unsupported_detector_hooks() {
+        let mut parts = super::Parts::default();
+        let env = crate::util::Env::from([
+            ("IMPECCABLE_PROVIDER_ID".to_string(), "gemini".to_string()),
+        ]);
+        let provider = crate::provider::detect(&env, "/missing-project");
+        let ctx = crate::context::load_context("/missing-project", &crate::target_args::TargetOptions::default(), &env);
+        super::append_detector_fallback(&mut parts, &ctx, "/missing-project", &env, &provider);
+        let output = parts.render();
+        assert!(output.contains("MANUAL_DETECTOR_REQUIRED"));
+        assert!(!output.contains("repair with impeccable hooks on"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_relative_launcher_is_spelled_absolute_when_run_from_another_dir() {
+        let env = crate::util::Env::from([
+            ("IMPECCABLE_SELF".to_string(), ".claude/skills/impeccable/scripts/impeccable".to_string()),
+        ]);
+        let provider = crate::provider::detect(&env, "/repo/apps/b");
+        let mut ctx = crate::context::load_context("/repo/apps/b", &crate::target_args::TargetOptions::default(), &env);
+        ctx.project_root = "/repo/apps/a".to_string();
+        assert_eq!(
+            super::changed_detect_command(&ctx, "/repo/apps/b", &provider),
+            "`/repo/apps/b/.claude/skills/impeccable/scripts/impeccable detect --json --changed` from `/repo/apps/a`"
+        );
+        // Run from cwd itself, the command is printed as given.
+        ctx.project_root = "/repo/apps/b".to_string();
+        assert_eq!(
+            super::changed_detect_command(&ctx, "/repo/apps/b", &provider),
+            "`.claude/skills/impeccable/scripts/impeccable detect --json --changed`"
+        );
+        // A bare name resolves on PATH from anywhere.
+        let bare = crate::provider::detect(&crate::util::Env::from([("IMPECCABLE_SELF".to_string(), "impeccable".to_string())]), "/repo/apps/b");
+        ctx.project_root = "/repo/apps/a".to_string();
+        assert_eq!(super::changed_detect_command(&ctx, "/repo/apps/b", &bare), "`impeccable detect --json --changed` from `/repo/apps/a`");
+        // A cwd with a space is quoted once it lands in the absolute path.
+        let spaced = crate::provider::detect(&env, "/work/My Apps/b");
+        ctx.project_root = "/work/My Apps/a".to_string();
+        assert_eq!(
+            super::changed_detect_command(&ctx, "/work/My Apps/b", &spaced),
+            "`'/work/My Apps/b/.claude/skills/impeccable/scripts/impeccable' detect --json --changed` from `/work/My Apps/a`"
+        );
+    }
+}
+
+#[cfg(test)]
+mod seeded_world_tests {
+    use crate::context::seeded_world;
+
+    #[test]
+    fn reads_the_world_line_from_the_frontmatter_only() {
+        assert_eq!(seeded_world(Some("---\nname: \"X\"\nworld: \"sd-seedbed-lobes\"\n---\n# X\n")).as_deref(), Some("sd-seedbed-lobes"));
+        assert_eq!(seeded_world(Some("---\nworld: kinpaku\n---\n")).as_deref(), Some("kinpaku"));
+        // A body line, a missing frontmatter and a value that is not an id never count.
+        assert_eq!(seeded_world(Some("---\nname: X\n---\nworld: \"kinpaku\"\n")), None);
+        assert_eq!(seeded_world(Some("# X\nworld: \"kinpaku\"\n")), None);
+        assert_eq!(seeded_world(Some("---\nworld: \"../etc\"\n---\n")), None);
+        assert_eq!(seeded_world(None), None);
+    }
+
+    const SEED: &str = "---\nname: \"Seedbed Lobes\"\nworld: \"sd-seedbed-lobes\"\n---\n# Design System: Seedbed Lobes\n\nReference image: https://impeccable.style/worlds/cards/sd-seedbed-lobes.webp\n";
+    // A create-next-app globals.css: three custom properties, enough to read as
+    // a visual implementation.
+    const STARTER_CSS: &str = ":root {\n  --background: #ffffff;\n  --foreground: #171717;\n  --font-mono: ui-monospace;\n}\n\nbody {\n  color: var(--foreground);\n  background: var(--background);\n}\n";
+
+    fn boot(product: bool, starter: bool) -> String {
+        boot_with(SEED, product.then_some("# P\n\n<!-- impeccable:product-schema 1 -->\n\n## Positioning\nA starter.\n"), starter)
+    }
+
+    fn boot_with(design: &str, product: Option<&str>, starter: bool) -> String {
+        let root = std::env::temp_dir().join(format!("impeccable-seeded-starter-{}-{}-{starter}-{}", std::process::id(), product.is_some(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let _ = std::fs::remove_dir_all(&root);
+        let project = root.join("project");
+        std::fs::create_dir_all(project.join(".git")).unwrap();
+        std::fs::create_dir_all(project.join("app")).unwrap();
+        std::fs::create_dir_all(root.join("home")).unwrap();
+        std::fs::write(project.join("DESIGN.md"), design).unwrap();
+        if starter {
+            std::fs::write(project.join("app/globals.css"), STARTER_CSS).unwrap();
+        }
+        if let Some(product) = product {
+            std::fs::write(project.join("PRODUCT.md"), product).unwrap();
+        }
+        assert_eq!(crate::context::has_visual_implementation(&project.to_string_lossy()), starter);
+        let home = root.join("home").to_string_lossy().into_owned();
+        let mut env = crate::util::Env::new();
+        for (k, v) in [("HOME", home.as_str()), ("USERPROFILE", home.as_str()), ("IMPECCABLE_NO_UPDATE_CHECK", "1"), ("IMPECCABLE_NO_STALENESS_CHECK", "1"), ("IMPECCABLE_NO_TELEMETRY", "1")] {
+            env.insert(k.to_string(), v.to_string());
+        }
+        let (mut io, cap) = impeccable_common::Io::captured("", project.clone(), env);
+        assert_eq!(super::run(&[], &mut io), 0);
+        let out = String::from_utf8(cap.stdout.borrow().clone()).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+        out
+    }
+
+    #[test]
+    fn a_seeded_world_outranks_starter_css() {
+        // Catches: a scaffold's globals.css silencing SEEDED_WORLD, so the boot
+        // reads boilerplate as the incumbent world and a roll replaces the world
+        // the person just chose.
+        for product in [false, true] {
+            let out = boot(product, true);
+            assert!(out.contains("SEEDED_WORLD: DESIGN.md names the catalog world `sd-seedbed-lobes`"), "product={product}: {out}");
+            assert!(out.contains("Never roll, re-pick, or replace it on your own initiative"), "product={product}: {out}");
+            assert!(!out.contains("no code carries it yet"), "product={product}: {out}");
+            // The no-PRODUCT.md boot must not also call the starter CSS the incumbent authority.
+            assert!(!out.contains("code and assets are incumbent design authority"), "product={product}: {out}");
+        }
+    }
+
+    #[test]
+    fn a_long_first_product_section_is_cut_within_the_budget() {
+        // Catches a PRODUCT.md whose opening section is itself huge pushing the directives past output limits.
+        let product = format!("# Big\n\n## Platform\n\n{}\n## Users\n\nsomeone\n", "A long line of product prose.\n".repeat(1000));
+        let out = boot_with(SEED, Some(&product), false);
+        let part = out.split("# PRODUCT.md (sections; full file: PRODUCT.md)").nth(1).unwrap().split("\n---\n").next().unwrap();
+        assert!(part.contains("(cut here; the rest is in the full file)"), "{part}");
+        assert!(part.len() < super::MAP_BUDGET * 2 + 300, "{}", part.len());
+    }
+
+    #[test]
+    fn a_long_design_md_arrives_as_its_map_and_a_short_one_as_written() {
+        let long = include_str!("../../../demos/landing-demo/DESIGN.md");
+        let product = include_str!("../../../demos/landing-demo/PRODUCT.md");
+        let out = boot_with(long, Some(product), false);
+        assert!(out.contains("# DESIGN.md (map; full file: DESIGN.md)\n\nName: Lumina\n"), "{out}");
+        // Whole sections up to the budget, the anti-references always among them.
+        assert!(out.contains("# PRODUCT.md (sections; full file: PRODUCT.md)\n\n# Lumina\n\n## Register\n\nbrand\n"), "{out}");
+        assert!(out.contains("## Anti-references\n"), "{out}");
+        assert!(!out.contains("DOCUMENT_NOT_INLINED"), "{out}");
+        assert!(!out.contains("Accessibility & Inclusion\n\nWCAG"), "{out}");
+        let out = boot_with(SEED, None, false);
+        assert!(out.contains(&format!("# DESIGN.md\n\n{}\n\n---", SEED.trim())), "{out}");
+    }
+
+    #[test]
+    fn explicit_redesign_or_different_world_overrides_the_seed() {
+        for product in [false, true] {
+            for starter in [false, true] {
+                let out = boot(product, starter);
+                assert!(out.contains("an explicit request from the person for a redesign or a different world overrides this"), "{out}");
+                assert!(out.contains("follow the redesign flow in reference/new-work.md"), "{out}");
+            }
+        }
     }
 }

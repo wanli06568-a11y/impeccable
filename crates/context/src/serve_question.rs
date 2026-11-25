@@ -20,6 +20,10 @@ const NEXT_CLAIM_GRACE_MS: f64 = 10000.0;
 /// Past the once-a-minute timer cadence Chrome gives a tab hidden for 5 minutes.
 const PAGE_CLOSED_GRACE_MS: f64 = 90000.0;
 
+/// How long `--wait` keeps asking for reruns on one unanswered hand. A harness
+/// that wakes the agent on every exit pays a full turn per rerun (#1566).
+const WAIT_BUDGET_MS: f64 = 30.0 * 60.0 * 1000.0;
+
 struct Args<'a> {
     argv: &'a [String],
 }
@@ -1281,11 +1285,14 @@ pub fn run(argv: &[String], io: &mut Io) -> i32 {
     }
     let wants_browser = !a.has("no-open") && !a.has("wait") && !a.has("stop") && !a.has("schema") && !a.has("update");
     if wants_browser && !env_set(&env, "IMPECCABLE_QUESTION_FORCE") {
+        // `claude -p` and the Agent SDK set an sdk-* entrypoint: nobody is there to answer.
+        let unattended = env.get("CLAUDE_CODE_ENTRYPOINT").is_some_and(|v| v.starts_with("sdk"));
         let headless = env_set(&env, "CI")
+            || unattended
             || (env_set(&env, "SSH_CONNECTION") && !env_set(&env, "DISPLAY"))
             || (cfg!(target_os = "linux") && !env_set(&env, "DISPLAY") && !env_set(&env, "WAYLAND_DISPLAY"));
         if headless {
-            io.out("serve-question: no browser detected in this environment (CI/headless/remote); use the structured question tool instead. Set IMPECCABLE_QUESTION_FORCE=1 to serve anyway.\n");
+            io.out("serve-question: no browser here (CI, headless or remote). Ask with the structured question tool; if no one can answer, take the default (the assigned card, else your recommended option), say in one line what you chose and how to change it, and carry on. Set IMPECCABLE_QUESTION_FORCE=1 to serve anyway.\n");
             return 2;
         }
     }
@@ -1367,6 +1374,15 @@ pub fn run(argv: &[String], io: &mut Io) -> i32 {
             (comps_missing_sidecar(&cwd, &comps, hand.as_ref()), stale_comps(&cwd, &comps, hand.as_ref()), landed_decision_comps(&cwd, &comps, hand.as_ref()), comps)
         };
         if !answered() {
+            // The clock starts at the later of this hand (a re-roll) and this
+            // server (a restart that reuses the hand).
+            let state = read_state(&qdir, &key);
+            let began = [hand.as_ref().and_then(|h| num_field(h, "startedAt")), state.as_ref().and_then(|s| num_field(s, "startedAt"))].into_iter().flatten().reduce(f64::max);
+            if began.is_some_and(|b| now_ms() - b > WAIT_BUDGET_MS) {
+                let url = state.as_ref().and_then(|s| s.get("url").and_then(Value::as_str)).unwrap_or_default();
+                io.out(&format!("PENDING: no answer after {} minutes on this hand, and the page is still served at {}. Stop rerunning --wait: tell the user the choice is waiting on that page and to tell you once they pick, then end your turn; when they do, run --wait --key {} once to collect it. Do not take a default or switch to the structured question tool while the page is open.\n", WAIT_BUDGET_MS / 60000.0, url, key));
+                return 5;
+            }
             io.out(&format!("WAITING: no answer yet after {}s; run --wait --key {} again\n", crate::util::js_number_to_string(poll_sec), key));
             if !missing.is_empty() {
                 io.out(&sidecar_missing_line(&env, &cwd, &missing));
@@ -1504,6 +1520,8 @@ pub fn run(argv: &[String], io: &mut Io) -> i32 {
         }
         let _ = std::fs::create_dir_all(&qdir);
         ignore_questions_dir(&qdir);
+        // Every round starts here, and its decision comps land in `.impeccable/mocks/decision/` after the page serves.
+        impeccable_common::git::ignore_runtime_output(&cwd);
         let key = a.arg("key").unwrap_or_else(random_key);
         let hand = match start_hand(&qdir, &key, &cwd, &start_payload, &dealt_worlds(roll.as_deref(), &start_payload), seed_with_key(roll_seed(roll.as_deref(), &start_payload), &env, &cwd)) {
             Ok(h) => h,
@@ -1620,7 +1638,7 @@ pub fn run(argv: &[String], io: &mut Io) -> i32 {
         let _ = std::fs::create_dir_all(&qdir);
         ignore_questions_dir(&qdir);
         let key = a.arg("key").unwrap_or_default();
-        let mut st = json!({ "pid": std::process::id(), "port": actual_port, "url": url });
+        let mut st = json!({ "pid": std::process::id(), "port": actual_port, "url": url, "startedAt": now_ms() as i64 });
         let comps = declared_comps(&state.lock().unwrap().payload);
         if !comps.is_empty() {
             st["comps"] = json!(comps);
@@ -4181,6 +4199,19 @@ mod tests {
         assert_eq!(roll_seed(Some(&api), &json!({ "options": [{ "id": "a" }] })), None, "a page that takes no roll");
         let stale = json!({ "scope": "direction", "key": "k", "reroll": 0, "at": (now_ms() - ROLL_WINDOW_MS - 1000.0) as u64, "source": "api" }).to_string();
         assert_eq!(roll_seed(Some(&stale), &page), None);
+    }
+
+    #[test]
+    fn start_keeps_decision_comps_out_of_git_before_they_exist() {
+        let dir = temp_project("mocks-ignored");
+        let mut round = direction_round(false);
+        round["buildPath"] = json!({ "value": "code", "toggle": true });
+        std::fs::write(dir.join("p.json"), round.to_string()).unwrap();
+        // A directory where the hand file goes fails the hand write, so --start stops before it spawns a server.
+        std::fs::create_dir_all(dir.join(".impeccable/questions/k1.hand.json/keep")).unwrap();
+        assert_eq!(run_captured(&dir, &["--start", "--payload", "p.json", "--no-open", "--key", "k1"]).0, 1);
+        assert!(dir.join(".impeccable/mocks/.gitignore").is_file() && dir.join(".impeccable/review/.gitignore").is_file());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

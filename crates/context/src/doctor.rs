@@ -63,7 +63,8 @@ fn read_project_root_patterns(repo_root: &str) -> Vec<String> {
     read_impeccable_project_roots(repo_root)
 }
 
-fn collect(cwd: &str, target: &TargetOptions, env: &Env, provider_id: &str) -> Report {
+fn collect(cwd: &str, target: &TargetOptions, env: &Env, provider: &crate::provider::Provider) -> Report {
+    let provider_id = provider.id.as_str();
     let ctx = load_context(cwd, target, env);
     let project_root = if ctx.project_root.is_empty() { cwd.to_string() } else { ctx.project_root.clone() };
     let abs_product_path = ctx.product_path.as_deref().map(|p| jsp::resolve(cwd, &[p]));
@@ -91,15 +92,20 @@ fn collect(cwd: &str, target: &TargetOptions, env: &Env, provider_id: &str) -> R
     findings.extend(boot.product);
     findings.extend(boot.native_platform);
     findings.extend(boot.design_sidecar);
-    findings.extend(check_design_drift(abs_design_path.as_deref(), &project_root, 25));
+    findings.extend(boot.design_drift);
+    // Reads the token files DESIGN.md names, so doctor runs it and the boot does not.
+    findings.extend(check_design_colour_drift(ctx.design.as_deref(), abs_design_path.as_deref(), &project_root));
+    findings.extend(crate::design_compact::check_sprawl(ctx.design.as_deref(), ctx.design_path.as_deref(), cwd));
     findings.extend(check_design_coverage(ctx.design.as_deref(), ctx.design_path.as_deref()));
     findings.extend(boot.config);
     findings.extend(boot.build_path);
     findings.extend(check_detector_ignores(&project_root, known.as_deref()));
     findings.extend(boot.surface_briefs);
+    findings.extend(crate::context_cli::check_hook_not_installed(&ctx, cwd, env, provider));
     let user_manifest = crate::context_cli::user_hook_manifest(provider_id, cwd, env);
     findings.extend(check_hook_installation(&project_root, Some(&ctx.repo_root), provider_id, user_manifest.as_deref()));
     findings.extend(check_legacy_live_state(&project_root));
+    findings.extend(check_spent_build_artifacts(&project_root));
     findings.extend(boot.project_roots);
     findings.extend(ws_findings);
 
@@ -254,18 +260,52 @@ fn render_text(report: &Report, fixes: Option<&Fixes>, cwd: &str, command: &str,
     lines.join("\n")
 }
 
+/// The printed fix command spells the launcher when the launcher exported
+/// IMPECCABLE_SELF, and the plain `impeccable` verb otherwise.
+fn self_cmd(env: &Env) -> String {
+    env.get("IMPECCABLE_SELF")
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .map(|v| impeccable_common::launcher::spell_self(&v))
+        .unwrap_or_else(|| "impeccable".to_string())
+}
+
+/// The text report for the installs at `skill_dirs`, for a caller that does
+/// not run from one of them. `impeccable update` runs from the npm shim, where
+/// the provider detects as `source` and the hook checks are skipped, so each
+/// skill folder names its own provider here, and a provider id exported in
+/// the caller's shell is dropped: kept, it would make every pass check the
+/// same harness. The findings are the same for every harness except the hook
+/// ones, so the reports merge into one. Returns the report and the first
+/// folder's `<prefix>impeccable` command.
+pub fn report_for_skills(skill_dirs: &[String], cwd: &str, env: &Env) -> Option<(String, String)> {
+    let mut merged: Option<(Report, String)> = None;
+    for dir in skill_dirs {
+        let mut env = env.clone();
+        env.insert("IMPECCABLE_SKILL_DIR".to_string(), dir.clone());
+        env.remove("IMPECCABLE_PROVIDER_ID");
+        let provider = crate::provider::detect(&env, cwd);
+        let report = collect(cwd, &TargetOptions::default(), &env, &provider);
+        match &mut merged {
+            None => merged = Some((report, provider.command)),
+            Some((first, _)) => {
+                for finding in report.findings {
+                    if !first.findings.contains(&finding) {
+                        first.findings.push(finding);
+                    }
+                }
+            }
+        }
+    }
+    let (report, command) = merged?;
+    Some((render_text(&report, None, cwd, &command, &self_cmd(env)), command))
+}
+
 pub fn run(args: &[String], io: &mut Io) -> i32 {
     let cwd = io.cwd.to_string_lossy().into_owned();
     let env = io.env.clone();
     let provider = crate::provider::detect(&env, &cwd);
-    // The printed fix command spells the launcher when the launcher exported
-    // IMPECCABLE_SELF, and the plain `impeccable` verb otherwise.
-    let self_cmd = env
-        .get("IMPECCABLE_SELF")
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
-        .map(|v| impeccable_common::launcher::spell_self(&v))
-        .unwrap_or_else(|| "impeccable".to_string());
+    let self_cmd = self_cmd(&env);
     let (flags, target) = match parse_args(args) {
         Ok(v) => v,
         Err(msg) => {
@@ -277,7 +317,7 @@ pub fn run(args: &[String], io: &mut Io) -> i32 {
         io.out(&format!("{}\n", usage()));
         return 0;
     }
-    let report = collect(&cwd, &target, &env, &provider.id);
+    let report = collect(&cwd, &target, &env, &provider);
     let fixes = if flags.fix { Some(apply_fixes(&report)) } else { None };
     if flags.json {
         let mut m = Map::new();
@@ -314,4 +354,43 @@ pub fn run(args: &[String], io: &mut Io) -> i32 {
     }
     io.out(&format!("{}\n", render_text(&report, fixes.as_ref(), &cwd, &provider.command, &self_cmd)));
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compacted_design_with_large_frontmatter_does_not_need_compacting_again() {
+        let root = std::env::temp_dir().join(format!("impeccable-doctor-compact-{}", std::process::id()));
+        let dir = root.join("site");
+        std::fs::create_dir_all(&dir).unwrap();
+        let colors: String = (0..60).map(|n| format!("  tone-{n:02}: \"oklch(0.5 0.04 {n})\"\n")).collect();
+        let design = format!("---\nname: Example\ncolors:\n{colors}---\n\n# Example\n\n## Layout\n\nConsult this layout section on demand.\n");
+        std::fs::write(dir.join("DESIGN.md"), &design).unwrap();
+        let cwd = root.to_string_lossy();
+        let args = vec!["--target".into(), "site".into()];
+        let target = crate::target_args::parse_target_options(&args, true).unwrap();
+        let env = Env::new();
+        let provider = crate::provider::detect(&env, &cwd);
+        let before = collect(&cwd, &target, &env, &provider);
+        assert!(before.findings.iter().any(|f| f.id == "design-md-sprawl"));
+        let (mut io, cap) = Io::captured("", root.clone(), env.clone());
+        let mut compact_args = args;
+        compact_args.push("--write".into());
+        assert_eq!(crate::design_compact::run(&compact_args, &mut io), 0, "{}", String::from_utf8_lossy(&cap.stderr.borrow()));
+        let compacted = std::fs::read_to_string(dir.join("DESIGN.md")).unwrap();
+        assert!(compacted.len() > crate::design_map::MAP_BUDGET);
+        assert_eq!(std::fs::read_to_string(dir.join(crate::design_compact::ARCHIVE)).unwrap(), design);
+        let lookup = crate::design_lookup::lookup(&compacted, "site/DESIGN.md", &dir, &["Layout".into()]);
+        assert!(lookup.contains("Consult this layout section on demand."), "{lookup}");
+        let after = collect(&cwd, &target, &env, &provider);
+        assert!(!after.findings.iter().any(|f| f.id == "design-md-sprawl"));
+        std::fs::remove_file(dir.join(crate::design_compact::ARCHIVE)).unwrap();
+        let missing = collect(&cwd, &target, &env, &provider);
+        assert!(!missing.findings.iter().any(|f| f.id == "design-md-sprawl"));
+        let finding = missing.findings.iter().find(|f| f.id == "design-archive-missing").unwrap();
+        assert!(finding.summary.contains(".impeccable/design-full.md"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

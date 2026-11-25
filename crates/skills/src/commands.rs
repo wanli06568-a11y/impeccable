@@ -264,7 +264,7 @@ fn provider_prompt_options() -> Vec<(&'static str, &'static str, CheckboxOption)
         .map(|input| {
             let (provider, label) = harness_display_name(input).expect("every picker input has a PROVIDER_DISPLAY row");
             let label = label.to_string();
-            let hint = format!("({provider}/skills)");
+            let hint = format!("({provider}/{})", skills_dir_name(provider));
             let search_text = format!("{label} {input} {provider} {hint}");
             (*input, provider, CheckboxOption { label, hint: Some(hint), search_text })
         })
@@ -386,6 +386,24 @@ fn choose_install_scope(sys: &Sys, prompt: &mut Prompt, io: &mut Io, project_roo
             return Err(Flow::Throw(format!("Unknown install scope: {v}. Use --scope=project or --scope=global.")));
         }
     }
+    // User-only providers (Muse) have no project skills folder: Muse reads
+    // ~/workspace/custom-skills only, so a project destination can never be
+    // read back. When Muse is among the targets its copy still lands in the
+    // global dir (see copy_provider_skills); when it is the only target the
+    // install as a whole is global, and an explicit project scope is an
+    // error rather than a silent install into <project>/workspace/skills.
+    let muse_only = !targets.is_empty() && targets.iter().all(|t| is_user_only_provider(t));
+    if muse_only {
+        if explicit == Some(Scope::Project) {
+            return Err(Flow::Throw(
+                "Muse is a global-only harness: it reads skills from ~/workspace/custom-skills, so --scope=project has nowhere valid to install. Re-run with --scope=global.".to_string(),
+            ));
+        }
+        return Ok(Scope::User);
+    }
+    if targets.iter().any(|t| is_user_only_provider(t)) && explicit == Some(Scope::Project) {
+        out(io, "Note: Muse is global-only; its skill installs into ~/workspace/custom-skills regardless of the project scope chosen for the other harnesses.");
+    }
     if let Some(s) = explicit {
         return Ok(s);
     }
@@ -456,8 +474,9 @@ fn report_hook_targets(sys: &Sys, io: &mut Io, written: &[String], wanted: &[&'s
     }
 }
 
-/// JS: decideHookInstall(root, targets, {yes})
-fn decide_hook_install(sys: &Sys, prompt: &mut Prompt, io: &mut Io, root: &str, targets: &[&'static str], yes: bool) -> R<bool> {
+/// JS: decideHookInstall(root, targets, {yes}). `user_scope`: the hooks
+/// already in place are looked up where a global install writes them.
+fn decide_hook_install(sys: &Sys, prompt: &mut Prompt, io: &mut Io, root: &str, targets: &[&'static str], yes: bool, user_scope: bool) -> R<bool> {
     if targets.is_empty() {
         return Ok(false);
     }
@@ -466,7 +485,15 @@ fn decide_hook_install(sys: &Sys, prompt: &mut Prompt, io: &mut Io, root: &str, 
         Some("accepted") => return Ok(true),
         _ => {}
     }
-    if targets.iter().all(|p| hook_installed_for_provider(sys, root, p)) {
+    let installed = |p: &&'static str| {
+        if user_scope {
+            let manifest_root = if *p == ".claude" { sys.home.as_str() } else { root };
+            hook_installed_for_provider_at_scope(sys, manifest_root, p, true)
+        } else {
+            hook_installed_for_provider(sys, root, p)
+        }
+    };
+    if targets.iter().all(installed) {
         return Ok(true);
     }
     if yes || !prompt.stdin_tty {
@@ -482,17 +509,85 @@ fn decide_hook_install(sys: &Sys, prompt: &mut Prompt, io: &mut Io, root: &str, 
 /// Update's hook self-heal (triage E8, and the retired Cursor gate): repairs
 /// the manifests at `hook_root` against the skill at `skill_root`. In user
 /// scope those differ (project manifests, home skill), and the home manifests
-/// are repaired as well, since an older `update --user` wrote Cursor, Codex
-/// and Grok manifests there. They are repaired, never pruned: a home manifest
-/// is global, so removing its entry would drop the hook from every other
-/// project. A home and a project hook firing for one edit is settled inside
-/// the hook (`hook_claim`).
+/// are repaired as well, since that is where a global install writes the
+/// Cursor, Codex and Grok hooks (#1190). They are repaired, never pruned: a
+/// home manifest is global, so removing its entry would drop the hook from
+/// every other project. A stale project copy is pruned only once the home
+/// hook is written (`prune_duplicate_home_hooks`); until then a home and a
+/// project hook firing for one edit is settled inside the hook (`hook_claim`).
 fn repair_update_hook_manifests(sys: &crate::providers::Sys, hook_root: &str, skill_root: &str, providers: &[&'static str]) -> Result<(), String> {
     hook_manifest::repair_stale_hook_manifests(sys, hook_root, providers, Some(skill_root))?;
     if hook_root != skill_root {
         hook_manifest::repair_stale_hook_manifests(sys, skill_root, providers, None)?;
     }
     Ok(())
+}
+
+/// An Impeccable skill under `<root>/.codex/skills`, which `update` never
+/// refreshes: `.codex/skills` is not an install target. Codex reads repository
+/// skills from `.agents/skills` only (its loader joins that onto each directory
+/// from the project root to the cwd), and the user-level install Impeccable
+/// maintains is `~/.agents/skills`, so a copy there (an unzipped bundle, a
+/// hand copy) stays at the version it was. `managed` holds the real paths of
+/// the skills dirs this run updates: an entry that resolves into one of them
+/// (the entry linked, or `.codex/skills` itself linked), or to the same place
+/// as its namesake there (both linked onto one checkout), is that install,
+/// not a copy, and is skipped without hiding a copy beside it. Returns the
+/// first copy's name.
+fn unmanaged_codex_skill(root: &str, managed: &[String]) -> Option<String> {
+    let skills_dir = util::jsp::join(&[root, ".codex", "skills"]);
+    util::read_dir_names(&skills_dir)?.into_iter().find(|n| {
+        if !is_impeccable_skill_name(n) || !is_skill_dir(&skills_dir, n) {
+            return false;
+        }
+        let skill_dir = util::jsp::join(&[&skills_dir, n]);
+        let real = util::realpath(&skill_dir).unwrap_or(skill_dir);
+        let parent = util::jsp::dirname(&real);
+        !managed.iter().any(|m| {
+            let twin = util::jsp::join(&[m, n]);
+            *m == parent || util::realpath(&twin).unwrap_or(twin) == real
+        })
+    })
+}
+
+/// Says so when `root` carries such a copy, so a run that reports the install
+/// as current or absent does not leave it sitting there unexplained (#1391).
+/// `has_agents`: the `.agents` install at this root is the one being updated,
+/// so the copy is a leftover; otherwise the install Codex reads is still to
+/// be made.
+fn note_unmanaged_codex_skill(sys: &Sys, io: &mut Io, root: &str, user: bool, has_agents: bool, managed: &[String]) {
+    let Some(name) = unmanaged_codex_skill(root, managed) else { return };
+    let shown = if user { format!("{}/.codex/skills/{name}", sys.format_path_for_display(root)) } else { format!(".codex/skills/{name}") };
+    let reads = if user {
+        "the user-level install Impeccable maintains is ~/.agents/skills/impeccable"
+    } else {
+        "Codex reads repository skills from .agents/skills, so that copy is never loaded"
+    };
+    let install = if user { "`npx impeccable install --providers=codex --scope=global`" } else { "`npx impeccable install --providers=codex`" };
+    let tail = if user { " so Codex loads one copy" } else { "" };
+    let step = if has_agents {
+        format!("Delete {shown}{tail}")
+    } else {
+        format!("Run {install} to install it there, then delete {shown}{tail}")
+    };
+    out(io, &format!("Found an Impeccable skill at {shown}, which update does not manage: {reads}. {step}."));
+}
+
+/// Ends an update with the doctor pass over the project: the skill just
+/// refreshed may read PRODUCT.md, DESIGN.md and the config differently from
+/// the version that wrote them. A report only; update repairs nothing in it.
+/// The fixes it names are the agent's to offer, so a run that installed a new
+/// version ends by sending the user to the `doctor` command there.
+fn report_doctor(sys: &Sys, io: &mut Io, root: &str, providers: &[&'static str], scope: Option<Scope>, updated: bool) {
+    let skill_dirs: Vec<String> =
+        sys.deduplicate_providers(root, providers, scope).into_iter().map(|(_, dir)| util::jsp::join(&[&dir, "impeccable"])).collect();
+    let cwd = io.cwd.to_string_lossy().into_owned();
+    if let Some((report, command)) = impeccable_context::doctor::report_for_skills(&skill_dirs, &cwd, &io.env) {
+        out(io, &format!("\n{}", report.trim_end()));
+        if updated {
+            out(io, &format!("\nNext step: run {command} doctor in your coding agent. It checks this project's setup against the version you just installed and offers the fixes."));
+        }
+    }
 }
 
 // ─── link ────────────────────────────────────────────────────────────────────
@@ -528,7 +623,7 @@ fn link(flags: &[String], io: &mut Io) -> R<()> {
             return Err(Flow::Exit(0));
         }
     }
-    let result = bundle::link_provider_skills(io, &source.bundle_root, &root, &targets, force).map_err(Flow::Throw)?;
+    let result = bundle::link_provider_skills(&sys, io, &source.bundle_root, &root, &targets, force).map_err(Flow::Throw)?;
     // Linked installs are excluded from install/update refreshes (overwriting
     // a symlink would destroy the link), so this is the only path that can
     // deliver the OpenCode command bridge to them. A copy, not a symlink: the
@@ -548,7 +643,13 @@ fn link(flags: &[String], io: &mut Io) -> R<()> {
     // launcher/binary executable bit there too (through the symlink), so a
     // checkout whose copier dropped modes still runs.
     for provider in &targets {
-        let skills_dir = util::jsp::join(&[&root, provider, "skills"]);
+        let skills_dir = if is_user_only_provider(provider) {
+            // Muse links land in the global dir under home (see
+            // link_provider_skills), not under the project root.
+            sys.user_provider_skills_dir(&sys.home, provider)
+        } else {
+            util::jsp::join(&[&root, provider, skills_dir_name(provider)])
+        };
         for skill in util::read_dir_names(&skills_dir).unwrap_or_default() {
             let dir = util::jsp::join(&[&skills_dir, &skill]);
             if util::is_dir(&dir) {
@@ -616,7 +717,7 @@ fn install(flags: &[String], io: &mut Io) -> R<()> {
         let linked_targets = sys.find_linked_providers(&install_root, &selected_installed, scope_opt);
         let copy_targets: Vec<&'static str> = selected_installed.iter().copied().filter(|p| !linked_targets.contains(p)).collect();
         let hook_targets: Vec<&'static str> = selected_installed.iter().chain(missing_selected_targets.iter()).copied().collect();
-        let want_hooks = install_hooks && decide_hook_install(&sys, &mut prompt, io, &hook_root, &hook_targets, yes)?;
+        let want_hooks = install_hooks && decide_hook_install(&sys, &mut prompt, io, &hook_root, &hook_targets, yes, scope == Scope::User)?;
         let mut bundle_dir: Option<String> = None;
         let outcome: Result<(), String> = (|| {
             if !linked_targets.is_empty() {
@@ -632,7 +733,7 @@ fn install(flags: &[String], io: &mut Io) -> R<()> {
                     .iter()
                     .copied()
                     .filter(|p| {
-                        let manifest_root = if scope == Scope::User && *p == ".claude" { &install_root } else { &hook_root };
+                        let manifest_root = if scope == Scope::User && matches!(*p, ".claude" | ".agent") { &install_root } else { &hook_root };
                         !hook_installed_for_provider_at_scope(&sys, manifest_root, p, scope == Scope::User)
                     })
                     .collect()
@@ -669,18 +770,26 @@ fn install(flags: &[String], io: &mut Io) -> R<()> {
 
             let mut fresh_written = 0usize;
             if !update_check_skipped && !missing_selected_targets.is_empty() {
-                let written = bundle::copy_provider_skills(&sys, &bdir, &install_root, &missing_selected_targets, scope_opt)?;
-                fresh_written = written.len();
-                if fresh_written == 0 {
+                let copied = bundle::copy_provider_skills(&sys, &bdir, &install_root, &missing_selected_targets, scope_opt)?;
+                fresh_written = copied.written.len();
+                // A preserved linked install is satisfied, not a missing
+                // bundle variant: only an empty result on both sides means
+                // the bundle had nothing for these targets.
+                if copied.written.is_empty() && copied.preserved_links.is_empty() {
                     err(io, &format!("Nothing was installed: the bundle had no variants for {}.", missing_selected_targets.join(", ")));
                     return Err(EXIT_1.to_string());
                 }
-                out(io, &format!(
-                    "Installed impeccable into: {} ({})",
-                    missing_selected_targets.join(", "),
-                    if scope == Scope::User { "global" } else { "project" }
-                ));
-                install_engine_binaries(&sys, io, &written);
+                if !copied.written.is_empty() {
+                    out(io, &format!(
+                        "Installed impeccable into: {} ({})",
+                        missing_selected_targets.join(", "),
+                        if scope == Scope::User { "global" } else { "project" }
+                    ));
+                }
+                if !copied.preserved_links.is_empty() {
+                    out(io, "A linked install is already in place and was left unchanged.");
+                }
+                install_engine_binaries(&sys, io, &copied.written);
                 let agents = bundle::copy_provider_agents(&sys, &bdir, &install_root, &missing_selected_targets, scope_opt)?;
                 bundle::report_provider_agents(&sys, io, &agents);
                 bundle::copy_provider_commands(&sys, &bdir, &install_root, &missing_selected_targets, scope_opt);
@@ -692,6 +801,13 @@ fn install(flags: &[String], io: &mut Io) -> R<()> {
                 Vec::new()
             };
             report_hook_targets(&sys, io, &written_hook_targets, if want_hooks { &hook_targets } else { &[] });
+            // Self-heal any pre-launcher (`node .../hook.mjs`) manifest left by a
+            // v3 install into a present provider dir (triage E8). Independent of
+            // hook consent: it repairs an existing hook rather than adding one.
+            // It runs before the duplicate cleanup below, as `update` does, so a
+            // stale project manifest it retargets at the home skill is then
+            // pruned rather than left as a second home hook.
+            hook_manifest::repair_stale_hook_manifests(&sys, &hook_root, &hook_targets, Some(&install_root))?;
             // A repeat user-scope install whose user hook is already current
             // never sends Claude through copy_provider_hooks, so the
             // duplicate-hook cleanup that function ends with runs here as well.
@@ -700,11 +816,15 @@ fn install(flags: &[String], io: &mut Io) -> R<()> {
             if want_hooks && scope == Scope::User && hook_targets.contains(&".claude") {
                 hook_manifest::prune_duplicate_claude_hooks(&sys, &install_root, &hook_root)?;
             }
-
-            // Self-heal any pre-launcher (`node .../hook.mjs`) manifest left by a
-            // v3 install into a present provider dir (triage E8). Independent of
-            // hook consent: it repairs an existing hook rather than adding one.
-            hook_manifest::repair_stale_hook_manifests(&sys, &hook_root, &hook_targets, Some(&install_root))?;
+            if want_hooks && scope == Scope::User && hook_targets.contains(&".agent") {
+                hook_manifest::prune_dead_project_antigravity_hook(&sys, &install_root, &hook_root)?;
+            }
+            // The same for Codex, Cursor and Grok, whose global hook is in
+            // home (#1190): a project an older global install wrote a
+            // manifest into loses only that stale copy.
+            if want_hooks && scope == Scope::User {
+                hook_manifest::prune_duplicate_home_hooks(&sys, &install_root, &hook_root, &hook_targets)?;
+            }
 
             if update_check_skipped {
                 out(io, "Existing skills were left unchanged.");
@@ -716,6 +836,7 @@ fn install(flags: &[String], io: &mut Io) -> R<()> {
             } else {
                 out(io, "Done!\n");
             }
+            name_global_copy(&sys, io, &install_root, scope);
             Ok(())
         })();
         if let Some(dir) = &bundle_dir {
@@ -737,12 +858,21 @@ fn install(flags: &[String], io: &mut Io) -> R<()> {
         return Err(Flow::Exit(1));
     }
 
-    let want_hooks = install_hooks && decide_hook_install(&sys, &mut prompt, io, &hook_root, &targets, yes)?;
+    let want_hooks = install_hooks && decide_hook_install(&sys, &mut prompt, io, &hook_root, &targets, yes, scope == Scope::User)?;
 
-    out(io, "\nDownloading impeccable skills...");
+    // A person at a terminal watches it download in place (impeccable_common::steps); anything else the plain line.
+    let steps = impeccable_common::steps::Steps::new(io);
+    let downloading = match &steps {
+        Some(steps) => Some(steps.progress(io, "Downloading impeccable skills")),
+        None => {
+            out(io, "\nDownloading impeccable skills...");
+            None
+        }
+    };
     let bundle_dir = match bundle::download_and_extract_bundle(&sys) {
         Ok(d) => d,
         Err(e) => {
+            drop(downloading);
             err(io, &format!("Download failed: {e}"));
             return Err(Flow::Exit(1));
         }
@@ -750,8 +880,8 @@ fn install(flags: &[String], io: &mut Io) -> R<()> {
 
     sys.migrate_unprefix_impeccable(&install_root, scope_opt);
 
-    let outcome: Result<(Vec<String>, Vec<bundle::AgentResult>, Vec<String>), String> = (|| {
-        let written = bundle::copy_provider_skills(&sys, &bundle_dir, &install_root, &targets, scope_opt)?;
+    let outcome: Result<(bundle::CopySkillsResult, Vec<bundle::AgentResult>, Vec<String>), String> = (|| {
+        let copied = bundle::copy_provider_skills(&sys, &bundle_dir, &install_root, &targets, scope_opt)?;
         let agents = bundle::copy_provider_agents(&sys, &bundle_dir, &install_root, &targets, scope_opt)?;
         bundle::copy_provider_commands(&sys, &bundle_dir, &install_root, &targets, scope_opt);
         let hooks = if want_hooks {
@@ -759,32 +889,64 @@ fn install(flags: &[String], io: &mut Io) -> R<()> {
         } else {
             Vec::new()
         };
-        Ok((written, agents, hooks))
+        Ok((copied, agents, hooks))
     })();
-    let (written, agent_results, hook_targets) = match outcome {
+    let (copied, agent_results, hook_targets) = match outcome {
         Ok(v) => v,
         Err(e) => {
             util::rm_rf(&bundle_dir);
+            drop(downloading);
             err(io, &format!("Install failed: {e}"));
             return Err(Flow::Exit(1));
         }
     };
     util::rm_rf(&bundle_dir);
 
-    if written.is_empty() {
+    if copied.written.is_empty() && copied.preserved_links.is_empty() {
+        drop(downloading);
         err(io, &format!("Nothing was installed: the bundle had no variants for {}.", targets.join(", ")));
         return Err(Flow::Exit(1));
     }
-    out(io, &format!(
-        "Installed impeccable into: {} ({})",
-        targets.join(", "),
-        if scope == Scope::User { "global" } else { "project" }
-    ));
-    install_engine_binaries(&sys, io, &written);
+    if copied.written.is_empty() {
+        drop(downloading);
+    } else {
+        let installed = format!("{} ({})", targets.join(", "), if scope == Scope::User { "global" } else { "project" });
+        match (&steps, downloading) {
+            (Some(steps), Some(downloading)) => downloading.done(steps, io, &format!("Installed impeccable into {installed}"), &[]),
+            _ => out(io, &format!("Installed impeccable into: {installed}")),
+        }
+    }
+    if !copied.preserved_links.is_empty() {
+        out(io, "A linked install is already in place and was left unchanged.");
+    }
+    install_engine_binaries(&sys, io, &copied.written);
     bundle::report_provider_agents(&sys, io, &agent_results);
     report_hook_targets(&sys, io, &hook_targets, if want_hooks { &targets } else { &[] });
-    out(io, "\nDone! Now type /impeccable init in your AI coding agent's chat (not in this terminal) to set up design context.\n");
+    name_global_copy(&sys, io, &install_root, scope);
+    match &steps {
+        Some(steps) => steps.done(io, "Done", &["Now type /impeccable init in your AI coding agent's chat (not in this terminal) to set up design context."]),
+        None => out(io, "\nDone! Now type /impeccable init in your AI coding agent's chat (not in this terminal) to set up design context.\n"),
+    }
     Ok(())
+}
+
+/// A project install beside a different global copy: agents load both, and the
+/// older one can answer instead, so name it and the command that updates it.
+fn name_global_copy(sys: &Sys, io: &mut Io, root: &str, scope: Scope) {
+    if let Some(line) = global_copy_line(
+        scope == Scope::Project && !sys.is_home_dir(root),
+        sys.get_skills_version(&sys.home, Some(Scope::User)),
+        sys.get_skills_version(root, Some(Scope::Project)),
+    ) {
+        out(io, &line);
+    }
+}
+
+fn global_copy_line(project: bool, global: Option<String>, here: Option<String>) -> Option<String> {
+    let (global, here) = (global?, here?);
+    (project && global != here).then(|| format!(
+        "\nYou also have Impeccable {global} installed for all projects, and your agent may use it instead of {here}. Update it with: npx impeccable update --user"
+    ))
 }
 
 // ─── update ──────────────────────────────────────────────────────────────────
@@ -820,10 +982,21 @@ fn update(flags: &[String], io: &mut Io) -> R<()> {
             }
             None => out(io, "No impeccable skill folders found in this project or at the user level."),
         }
+        let home_rooted = sys.is_home_dir(&project_root);
+        if explicit_scope != Some(Scope::User) && !home_rooted {
+            note_unmanaged_codex_skill(&sys, io, &project_root, false, false, &[]);
+        }
+        if explicit_scope != Some(Scope::Project) {
+            note_unmanaged_codex_skill(&sys, io, &home, true, false, &[]);
+        }
         out(io, "Run `npx impeccable install` to install first.");
         return Err(Flow::Exit(1));
     };
 
+    // An unscoped run that found no project install and fell back to the user
+    // one: the project may still hold a `.codex/skills` copy, which is why
+    // nothing was found there, so that root is checked as well.
+    let fell_back_to_user = matches!(target, UpdateTarget::Resolved { scope: Some(Scope::User), .. }) && explicit_scope.is_none();
     let (root, scope, agent_scope, providers, scope_label) = match target {
         UpdateTarget::Resolved { root, scope, agent_scope, providers, scope_label } => (root, scope, agent_scope, providers, scope_label),
         UpdateTarget::Ambiguous { project_providers, user_providers } => {
@@ -846,10 +1019,18 @@ fn update(flags: &[String], io: &mut Io) -> R<()> {
     };
 
     out(io, &format!("Updating the {scope_label} install: {} ({})", sys.format_path_for_display(&root), providers.join(", ")));
-    // Hook manifests follow install's placement: a user-scope install keeps
-    // the skill under home but writes every non-Claude manifest (Cursor,
-    // Codex, Grok, ...) into the project, so update repairs and writes them
-    // there too, against the home skill root.
+    let user_root = scope != Some(Scope::Project);
+    let has_agents = providers.contains(&".agents");
+    let managed: Vec<String> = sys
+        .deduplicate_providers(&root, &providers, scope)
+        .into_iter()
+        .map(|(_, dir)| util::realpath(&dir).unwrap_or(dir))
+        .collect();
+    // Hook manifests follow install's placement: a user-scope install writes
+    // the Claude, Codex, Cursor and Grok hooks under home and the rest
+    // (Copilot, Gemini) into the project, against the home skill root
+    // (`copy_provider_hooks` picks each destination). `hook_root` is that
+    // project, where consent is read and the project manifests are repaired.
     let hook_root = if scope == Some(Scope::User) { project_root.clone() } else { root.clone() };
     let linked_providers = sys.find_linked_providers(&root, &providers, scope);
     let copy_providers: Vec<&'static str> = providers.iter().copied().filter(|p| !linked_providers.contains(p)).collect();
@@ -885,7 +1066,7 @@ fn update(flags: &[String], io: &mut Io) -> R<()> {
             // Repair any stale pre-launcher (`node .../hook.mjs`) manifest a v3
             // install left behind, regardless of hook consent (triage E8).
             repair_update_hook_manifests(&sys, &hook_root, &root, &copy_providers).map_err(Flow::Throw)?;
-            let want_hooks = install_hooks && decide_hook_install(&sys, &mut prompt, io, &hook_root, &copy_providers, yes)?;
+            let want_hooks = install_hooks && decide_hook_install(&sys, &mut prompt, io, &hook_root, &copy_providers, yes, scope == Some(Scope::User))?;
             let hook_targets = if want_hooks {
                 copy_provider_hooks(&sys, &tmp_dir, &hook_root, &copy_providers, force, Some(&root), Some(&project_root)).map_err(Flow::Throw)?
             } else {
@@ -899,7 +1080,12 @@ fn update(flags: &[String], io: &mut Io) -> R<()> {
                 let v = sys.get_skills_version(&root, scope);
                 out(io, &format!("Skills are up to date{}.", version_suffix(&v)));
                 report_hook_targets(&sys, io, &hook_targets, if want_hooks { &copy_providers } else { &[] });
+                note_unmanaged_codex_skill(&sys, io, &root, user_root, has_agents, &managed);
+                if fell_back_to_user {
+                    note_unmanaged_codex_skill(&sys, io, &project_root, false, false, &managed);
+                }
                 out(io, "Nothing else to do.");
+                report_doctor(&sys, io, &root, &copy_providers, scope, false);
                 Err(Flow::Exit(0))
             }
             Err(Flow::Throw(e)) => {
@@ -939,7 +1125,7 @@ fn update(flags: &[String], io: &mut Io) -> R<()> {
         // Repair any stale pre-launcher (`node .../hook.mjs`) manifest a v3
         // install left behind, regardless of hook consent (triage E8).
         repair_update_hook_manifests(&sys, &hook_root, &root, &copy_providers).map_err(Flow::Throw)?;
-        let want_hooks = install_hooks && decide_hook_install(&sys, &mut prompt, io, &hook_root, &providers, yes)?;
+        let want_hooks = install_hooks && decide_hook_install(&sys, &mut prompt, io, &hook_root, &providers, yes, scope == Some(Scope::User))?;
         let hook_targets = if want_hooks {
             copy_provider_hooks(&sys, &tmp_dir, &hook_root, &providers, force, Some(&root), Some(&project_root)).map_err(Flow::Throw)?
         } else {
@@ -950,7 +1136,12 @@ fn update(flags: &[String], io: &mut Io) -> R<()> {
         out(io, &format!("Updated {} skill(s){}.", refreshed.len(), to_version_suffix(&v)));
         install_engine_binaries(&sys, io, &refreshed);
         report_hook_targets(&sys, io, &hook_targets, if want_hooks { &providers } else { &[] });
-        out(io, "Done!\n");
+        note_unmanaged_codex_skill(&sys, io, &root, user_root, has_agents, &managed);
+        if fell_back_to_user {
+            note_unmanaged_codex_skill(&sys, io, &project_root, false, false, &managed);
+        }
+        out(io, "Done!");
+        report_doctor(&sys, io, &root, &copy_providers, scope, true);
         Ok(())
     })();
     match outcome {
@@ -1075,5 +1266,25 @@ mod offline_install_tests {
         assert!(stderr.contains("Download failed: Could not download skill bundle: Network Error"), "{stderr}");
         assert!(!stderr.contains("verify"), "{stderr}");
         assert!(!std::path::Path::new(&format!("{}/.claude/skills/impeccable", fx.project)).exists());
+    }
+}
+
+#[cfg(test)]
+mod global_copy_tests {
+    use super::global_copy_line;
+
+    // Catches a project install staying silent beside a different global copy, or
+    // naming it when the two match or the install was the global one.
+    #[test]
+    fn names_a_different_global_copy_after_a_project_install() {
+        let v = |s: &str| Some(s.to_string());
+        let line = global_copy_line(true, v("4.8.0"), v("4.9.1")).unwrap();
+        assert!(
+            line.contains("4.8.0") && line.contains("npx impeccable update --user"),
+            "{line}"
+        );
+        assert_eq!(global_copy_line(true, v("4.9.1"), v("4.9.1")), None);
+        assert_eq!(global_copy_line(false, v("4.8.0"), v("4.9.1")), None);
+        assert_eq!(global_copy_line(true, None, v("4.9.1")), None);
     }
 }

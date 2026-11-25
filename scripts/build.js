@@ -16,6 +16,7 @@
  * and builds Tailwind CSS for production deployment.
  */
 
+import { checkTokenBudget } from './lib/token-budget.js';
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
@@ -205,7 +206,11 @@ function validatePluginVersions(rootDir) {
  * this wrapper owns the console output and the error count the build gates on.
  */
 function validatePluginManifestShape(rootDir) {
-  const findings = collectPluginManifestFindings(rootDir);
+  // Source-first builds validate the newly emitted agents; tracked plugin output
+  // is intentionally refreshed only by release/main-sync builds.
+  const findings = collectPluginManifestFindings(rootDir, BUILD_OPTIONS.syncRootOutputs ? {} : {
+    agentsDir: path.join(DIST_DIR, 'claude-code', '.claude', 'agents'),
+  });
   for (const { relPath, reason } of findings) {
     console.error(`  ❌ ${relPath}: ${reason}`);
   }
@@ -481,6 +486,47 @@ function validateAskInstructionSites(rootDir) {
 }
 
 /**
+ * Validate that Claude Code's description still fits its skill-listing budget.
+ *
+ * Claude Code lists a non-bundled skill by its bare name when the listing is
+ * over budget (1% of the context window in characters: 6,000 on a 200k model)
+ * and the description doesn't fit in what the bundled skills leave. Measured on
+ * Claude Code 2.1.281: about 220 characters survives beside its default bundled
+ * skills, 225 does not (tests/skill-behavior/README.md). The cap keeps headroom
+ * under that, so a longer draft fails here rather than vanishing for users.
+ *
+ * Returns the number of validation errors. Build fails if > 0.
+ */
+const CLAUDE_CODE_DESCRIPTION_MAX = 200;
+/**
+ * Token budget: every LLM-facing skill file and each common use's up-front
+ * load stay under the caps in scripts/token-budget.json.
+ *
+ * Returns the number of validation errors. Build fails if > 0.
+ */
+function validateTokenBudget(rootDir) {
+  const { errors, rows } = checkTokenBudget(rootDir);
+  for (const e of errors) console.error(`  ❌ ${e}`);
+  if (!errors.length) console.log(`✓ Token budget: ${rows.join('; ')}`);
+  return errors.length;
+}
+
+function validateClaudeCodeDescription(rootDir) {
+  const src = fs.readFileSync(path.join(rootDir, 'skill', 'SKILL.src.md'), 'utf-8');
+  const m = src.match(/^claude-code-description:\s*"(.*)"\s*$/m);
+  if (!m) {
+    console.error('  ❌ skill/SKILL.src.md has no claude-code-description; Claude Code would list the shared description, which is over its budget');
+    return 1;
+  }
+  if (m[1].length > CLAUDE_CODE_DESCRIPTION_MAX) {
+    console.error(`  ❌ claude-code-description is ${m[1].length} characters; Claude Code's skill listing drops it above about 220, and the cap is ${CLAUDE_CODE_DESCRIPTION_MAX}`);
+    return 1;
+  }
+  console.log(`✓ claude-code-description: ${m[1].length} of ${CLAUDE_CODE_DESCRIPTION_MAX} characters`);
+  return 0;
+}
+
+/**
  * Validate that every hand-authored HTML page carries the shared site header.
  * The partial is stamped with `<!-- site-header v1 -->` so drift is loud.
  *
@@ -498,8 +544,8 @@ function validateAskInstructionSites(rootDir) {
 function validateBatchLineEndings(rootDir, distDir, { syncRootOutputs }) {
   const dirs = [distDir];
   if (syncRootOutputs) {
-    for (const { configDir } of Object.values(PROVIDERS)) {
-      dirs.push(path.join(rootDir, configDir, 'skills', 'impeccable'));
+    for (const { configDir, skillsDirName = 'skills' } of Object.values(PROVIDERS)) {
+      dirs.push(path.join(rootDir, configDir, skillsDirName, 'impeccable'));
     }
     dirs.push(path.join(rootDir, 'plugin'), path.join(rootDir, 'cursor-plugin'));
   }
@@ -564,10 +610,11 @@ function syncRootHookManifests(rootDir) {
     const manifest = hooksJsonFor(config.emitHooks, { configDir: config.configDir });
     if (!manifest) continue;
     const rel = config.hooksManifestRel || path.join('hooks', 'hooks.json');
-    const dest = path.join(rootDir, config.configDir, rel);
+    const dir = config.hooksManifestDir || config.configDir;
+    const dest = path.join(rootDir, dir, rel);
     fs.mkdirSync(path.dirname(dest), { recursive: true });
     fs.writeFileSync(dest, JSON.stringify(manifest, null, 2) + '\n');
-    synced.push(path.join(config.configDir, rel).split(path.sep).join('/'));
+    synced.push(path.join(dir, rel).split(path.sep).join('/'));
   }
   return synced;
 }
@@ -607,8 +654,8 @@ async function stageEngineBinaries(rootDir, distDir) {
     return;
   }
   let copies = 0;
-  for (const { provider, configDir } of Object.values(PROVIDERS)) {
-    const scriptsDir = path.join(distDir, provider, configDir, 'skills', 'impeccable', 'scripts');
+  for (const { provider, configDir, skillsDirName = 'skills' } of Object.values(PROVIDERS)) {
+    const scriptsDir = path.join(distDir, provider, configDir, skillsDirName, 'impeccable', 'scripts');
     if (!fs.existsSync(scriptsDir)) continue;
     for (const target of present) {
       const src = path.join(binRoot, target, binaryName(target));
@@ -670,6 +717,18 @@ function assembleUniversal(distDir) {
     }
   }
 
+  // A hook manifest the harness reads from outside its configDir
+  // (Antigravity: `.agents/hooks.json`) is copied on its own, after every
+  // provider dir, so it lands where the harness looks.
+  for (const { provider, hooksManifestDir, hooksManifestRel } of providerConfigs) {
+    if (!hooksManifestDir || !hooksManifestRel) continue;
+    const src = path.join(distDir, provider, hooksManifestDir, hooksManifestRel);
+    if (!fs.existsSync(src)) continue;
+    const dest = path.join(universalDir, hooksManifestDir, hooksManifestRel);
+    fs.mkdirSync(path.dirname(dest), { recursive: true });
+    fs.copyFileSync(src, dest);
+  }
+
   // Add a visible README so macOS users don't see an empty folder
   // (all provider dirs are dotfiles, hidden by default in Finder)
   fs.writeFileSync(path.join(universalDir, 'README.txt'),
@@ -684,7 +743,7 @@ This folder contains skills for all supported tools:
   .dsh/       -> DeepSeek Harness
   .gemini/    -> Gemini CLI
   .codex/     -> Codex custom agents (Codex skills use .agents/)
-  .agents/    -> Codex CLI
+  .agents/    -> Codex CLI (and hooks.json, the Antigravity design hook)
   .agent/     -> Antigravity
   .github/    -> GitHub Copilot
   .grok/      -> Grok Build
@@ -699,6 +758,7 @@ This folder contains skills for all supported tools:
   .vibe/      -> Mistral Vibe
   .veto/      -> Veto model-routing harness
   .qoder/     -> Qoder
+  workspace/custom-skills/ -> Muse (copy workspace/ into your Muse home)
 
 To install, copy the relevant folder(s) into your project root.
 For Codex, repo and user skill installs come from .agents/skills.
@@ -761,9 +821,9 @@ async function build() {
     // consumes that layout; keep generated Codex bundles under dist/ only.
     const syncConfigs = Object.values(PROVIDERS).filter(({ configDir }) => configDir !== '.codex');
 
-    for (const { provider, configDir } of syncConfigs) {
-      const skillsSrc = path.join(DIST_DIR, provider, configDir, 'skills');
-      const skillsDest = path.join(ROOT_DIR, configDir, 'skills');
+    for (const { provider, configDir, skillsDirName = 'skills' } of syncConfigs) {
+      const skillsSrc = path.join(DIST_DIR, provider, configDir, skillsDirName);
+      const skillsDest = path.join(ROOT_DIR, configDir, skillsDirName);
 
       if (fs.existsSync(skillsSrc)) {
         // Preserve legacy per-project script artifacts (e.g. live-mode config.json)
@@ -820,9 +880,9 @@ async function build() {
       'critique', 'delight', 'distill', 'harden', 'layout', 'optimize',
       'overdrive', 'polish', 'quieter', 'shape', 'typeset',
     ];
-    for (const { configDir } of syncConfigs) {
+    for (const { configDir, skillsDirName = 'skills' } of syncConfigs) {
       for (const name of deprecatedLocalSkills) {
-        const p = path.join(ROOT_DIR, configDir, 'skills', name);
+        const p = path.join(ROOT_DIR, configDir, skillsDirName, name);
         if (fs.existsSync(p)) fs.rmSync(p, { recursive: true, force: true });
       }
     }
@@ -992,10 +1052,16 @@ async function build() {
   // guidance to every provider at once.
   const askSiteErrors = validateAskInstructionSites(ROOT_DIR);
 
+  // Claude Code drops a description that outgrows its skill-listing budget.
+  const claudeDescriptionErrors = validateClaudeCodeDescription(ROOT_DIR);
+
   // cmd.exe misparses an LF-only batch file, so every emitted .cmd is CRLF.
   const batchEolErrors = validateBatchLineEndings(ROOT_DIR, DIST_DIR, BUILD_OPTIONS);
 
-  if (countErrors > 0 || versionErrors > 0 || manifestShapeErrors > 0 || proseErrors > 0 || skillProseErrors > 0 || askSiteErrors > 0 || batchEolErrors > 0) {
+  // What the skill loads into an agent's context stays under its byte caps.
+  const tokenBudgetErrors = validateTokenBudget(ROOT_DIR);
+
+  if (countErrors > 0 || versionErrors > 0 || manifestShapeErrors > 0 || proseErrors > 0 || skillProseErrors > 0 || askSiteErrors > 0 || claudeDescriptionErrors > 0 || batchEolErrors > 0 || tokenBudgetErrors > 0) {
     process.exit(1);
   }
 

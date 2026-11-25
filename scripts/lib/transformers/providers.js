@@ -3,11 +3,17 @@
  *
  * Each config specifies:
  * - provider: key into PROVIDER_PLACEHOLDERS (e.g. 'claude-code')
- * - configDir: dot-directory name (e.g. '.claude')
+ * - configDir: dot-directory name (e.g. '.claude'); Muse uses 'workspace'
+ * - skillsDirName: optional folder under configDir holding skills
+ *   (default 'skills'; Muse uses 'custom-skills')
+ * - hooksManifestDir: optional dot-directory the hook manifest is written
+ *   under when the harness reads it from outside configDir (Antigravity)
  * - displayName: human-readable name for log output (e.g. 'Claude Code')
  * - providerTags: markdown block tags kept for this target (e.g. <codex>...</codex>)
  * - frontmatterFields: which optional fields to emit beyond name + description
  * - bodyTransform: optional function (body, skill) => transformed body
+ * - descriptionKey: optional skill property used as the frontmatter description
+ *   instead of the shared one (falls back to it when empty)
  */
 export const PROVIDERS = {
   cursor: {
@@ -29,6 +35,10 @@ export const PROVIDERS = {
     providerTags: ['claude-code', 'claude'],
     configDir: '.claude',
     displayName: 'Claude Code',
+    // Claude Code caps its skill listing (1% of the context window in characters) and lists
+    // a skill that doesn't fit as its bare name, so it gets the short description
+    // (SKILL.src.md `claude-code-description`; tests/skill-behavior/README.md).
+    descriptionKey: 'claudeCodeDescription',
     frontmatterFields: ['user-invocable', 'argument-hint', 'license', 'compatibility', 'metadata'],
     // allowed-tools omitted: Claude Code blocks skill activation in non-interactive
     // sessions when the field is present (issue #736). Other providers keep it.
@@ -197,6 +207,14 @@ export const PROVIDERS = {
     configDir: '.agent',
     displayName: 'Antigravity',
     frontmatterFields: ['license', 'compatibility', 'metadata', 'allowed-tools'],
+    emitHooks: 'antigravity',
+    // Antigravity discovers workspace hooks from `.agents/hooks.json` (or
+    // global `~/.gemini/config/hooks.json`), not from beside its skills in
+    // `.agent/`. `hooksManifestDir` names the folder the manifest is written
+    // under, in place of `configDir`, in every output: the provider dist,
+    // the universal bundle, and the root harness sync.
+    hooksManifestDir: '.agents',
+    hooksManifestRel: 'hooks.json',
   },
   hermes: {
     provider: 'hermes',
@@ -211,6 +229,23 @@ export const PROVIDERS = {
     // .hermes/plugins/, since Hermes hooks are in-process plugin callbacks.
     frontmatterFields: ['license', 'compatibility', 'metadata'],
     pluginPayload: { source: 'hermes-plugin', dest: 'plugins/impeccable-design-hook' },
+  },
+  muse: {
+    provider: 'muse',
+    providerTags: ['muse'],
+    // Muse (Meta's personal AI agent) has no dot-dir config folder: user
+    // custom skills live in ~/workspace/custom-skills/<name>/SKILL.md, so
+    // the generated layout is workspace/custom-skills/ rather than the
+    // usual <dot-dir>/skills/. Muse reads only the `name` and
+    // `description` frontmatter fields, so no optional fields are emitted;
+    // the version rides under `metadata` like the Codex build. Muse has
+    // no documented hooks or subagent file format, so no emitHooks /
+    // agentFormat.
+    configDir: 'workspace',
+    skillsDirName: 'custom-skills',
+    displayName: 'Muse',
+    frontmatterFields: [],
+    versionInMetadata: true,
   },
   devin: {
     provider: 'devin',

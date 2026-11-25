@@ -38,6 +38,10 @@ crates/
                every check takes in and hands back
   core         the rule logic: every `check_*` / `scan_*` and its heuristics,
                the browser rule adapters, the visual-contrast decisions
+  foundations-scan
+               the Foundations file checks over a `Source` (no fs, process
+               or clock): the CLI's disk source, and `scan_listing` over a
+               repository's tree listing for wasm hosts
   wasm         wasm-bindgen exports over `core` (the in-page bundle and the
                extension's offscreen core)
   bundle       the page JS plus the bundler: in-page bundle, extension
@@ -206,6 +210,42 @@ registered rows after it (`registry::extend`, `registry::all_antipatterns`).
 `extend` is idempotent per slice and panics on an id collision, so a pack can
 never shadow a built-in rule. Registration is append-only and has no undo:
 a pack is a property of the process, not of a run.
+
+### Building a CLI with a pack
+
+The `impeccable` package also exports a library router: `run(args, io, pack)`.
+The open binary calls it with `InstalledPack::NONE`. A downstream workspace
+can depend on the `impeccable` and `impeccable-common` packages from this
+repository at the same Git tag and build its own binary named `impeccable`:
+
+```rust
+use impeccable::{run, InstalledPack};
+use impeccable_common::Io;
+use std::io::Write;
+
+fn main() {
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    let mut io = Io::stdio();
+    let pack = InstalledPack {
+        rule_pack: Some(&my_rules::PACK),
+        static_rule_pack: Some(&my_rules::PACK),
+    };
+    let code = run(&args, &mut io, pack);
+    let _ = io.stdout.flush();
+    let _ = io.stderr.flush();
+    std::process::exit(code);
+}
+```
+
+`InstalledPack` aliases foundation's `RulePackSet<dyn StaticRulePack>`.
+The generic static hook keeps foundation independent of HTML's document
+model. Either hook may be absent; static-only rules declare their registry
+rows through `RulePack::registry` as well. The router registers those rows
+before dispatch and supplies the hooks to file, static HTML, URL (including
+shared sessions and CDP), and edit/Stop hook scans. Use namespaced rule ids;
+registration remains process-wide, idempotent for the same rows, and panics
+on collisions. No feature flags, source edits, or runtime loading are needed.
+The live overlay's embedded wasm remains a separate build (see above).
 
 ### The wasm `detect` feature
 
